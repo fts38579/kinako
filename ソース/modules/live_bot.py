@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – LiveBot  v9.1
+カワウソマネージャー きなこ – LiveBot  v9.3
 変更:
   v8.8: _gift_last を __init__ に移動（競合リスク解消）
   v8.9: stop_event 連携追加（GUI停止ボタンでループ終了）
@@ -8,12 +8,22 @@
         start() は非ブロッキング Task を返すだけで WebSocket が動かない
         connect() は接続が切れるまでブロックする正しい API
         gift.name の取得方法を修正（event.gift.name）
-        ログ出力を詳細化してデバッグしやすくした
   v9.1: [修正] _fire_end_callback を daemon=True に変更
-        （アプリ終了をブロックしない）
         [修正] モジュールレベルの config 参照を遅延ロードに変更
-        （LiveBot.__init__ 内で importlib.reload(config) を実行）
         [修正] _init_csv/_init_viewers_csv を None ガード付きに変更
+  v9.2: [根本修正] stop_event セット時に connect() を即座に中断する仕組みを追加
+        ─ 問題: connect() は WebSocket が物理的に切断されるまでブロックし続ける
+                stop_event をセットしても connect() は気づかないので永遠に戻らない
+                → 監視停止ボタンを押してもアプリが固まる（強制終了の真の原因）
+        ─ 修正: _connect_with_stop() を追加
+                asyncio.create_task(connect()) と並行して
+                stop_watchdog() タスクを走らせ、stop_event 検知時に
+                client.disconnect() を呼んで connect() を正常終了させる
+  v9.3: [修正] TikTokLiveClient を毎回 NEW インスタンスで作成
+        (再利用すると内部状態が残り接続が不安定になる)
+        [修正] start() の直前に stop_event チェックを追加（高速応答）
+        [修正] _connect_with_stop() の watchdog 間隔を 0.3 秒に短縮
+        [修正] start()内の finally で client を確実にクリーンアップ
 """
 
 import sys
@@ -46,7 +56,7 @@ else:
 def _data_path(rel: str) -> str:
     return os.path.join(_PROJECT_ROOT, rel)
 
-# ★ v9.1 修正: モジュールレベルでは一旦インポートするだけ
+# ★ v9.1: モジュールレベルでは一旦インポートするだけ
 # 実際の値参照は LiveBot.__init__ 内で reload() 後に行う
 try:
     import config
@@ -73,7 +83,7 @@ def _is_offline_error(e: Exception) -> bool:
     msgs = ("hosting", "offline", "is not online", "is not live",
             "not currently live", "UserOffline", "LIVE_NOT_FOUND",
             "userofflineerror", "usernotfounderror")
-    s = str(e).lower()
+    s    = str(e).lower()
     name = type(e).__name__.lower()
     return any(m.lower() in s for m in msgs) or name in msgs
 
@@ -189,7 +199,7 @@ class LiveBot:
     def __init__(self,
                  on_stream_end_callback: Optional[Callable] = None,
                  stop_event: Optional[threading.Event] = None):
-        # ★ v9.1 修正: __init__ 内で config を再ロードして最新値を保証
+        # ★ v9.1: __init__ 内で config を再ロードして最新値を保証
         global config
         if config is not None:
             try:
@@ -209,7 +219,7 @@ class LiveBot:
         self.username          = getattr(config, 'MY_TIKTOK_USERNAME', '') if config else ''
         self._on_stream_end_cb = on_stream_end_callback
         self._stop_event       = stop_event  # GUI 停止ボタンと連携
-        self.client            = None
+        self.client: Optional[TikTokLiveClient] = None
 
         self._stream_started   = False
         self._stream_end_fired = False
@@ -232,12 +242,12 @@ class LiveBot:
 
     def _fire_end_callback(self):
         """on_stream_end_callback をスレッドで安全に一度だけ発火
-        ★ v9.1 修正: daemon=True に変更（アプリ終了をブロックしない）
+        ★ v9.1: daemon=True（アプリ終了をブロックしない）
         """
         if self._on_stream_end_cb:
             if self._end_cb_thread is None or not self._end_cb_thread.is_alive():
                 self._end_cb_thread = threading.Thread(
-                    target=self._on_stream_end_cb, daemon=True)  # daemon=True
+                    target=self._on_stream_end_cb, daemon=True)
                 self._end_cb_thread.start()
 
     # ── イベントハンドラ ──────────────────────────────────────────
@@ -277,7 +287,6 @@ class LiveBot:
     async def _on_gift(self, event: GiftEvent):
         try:
             name, uid = _extract_user(event)
-            # v9.0 修正: event.gift.name が正しいアクセス方法
             try:
                 gift_name = _safe_str(event.gift.name) if event.gift else "不明"
             except Exception:
@@ -285,10 +294,8 @@ class LiveBot:
             if not gift_name:
                 gift_name = "不明"
 
-            # ストリーク中（コンボ継続中）は repeat_end が False = まだ続いている
-            # repeat_end が True = ストリーク終了 → その時だけカウント
             if hasattr(event, 'streaking') and event.streaking:
-                return  # ストリーク継続中はスキップ（重複防止）
+                return
 
             count = getattr(event, "repeat_count", 1) or 1
 
@@ -320,6 +327,45 @@ class LiveBot:
         except Exception as e:
             print(f"[Join] 処理エラー: {e}")
 
+    # ── ★ v9.2/v9.3 核心修正: stop_event 対応の接続メソッド ─────────────
+    async def _connect_with_stop(self) -> None:
+        """
+        connect() と並行して stop_watchdog を走らせることで、
+        stop_event がセットされたら client.disconnect() を呼んで
+        connect() を正常終了させる。
+
+        ★ これが「監視停止ボタンを押してもアプリが固まる」問題の根本修正。
+          connect() 自体は stop_event を見ないので、
+          外部から disconnect() を呼ぶ必要がある。
+        """
+        assert self.client is not None
+
+        stop = self._stop_event
+
+        async def stop_watchdog():
+            """stop_event を 0.3 秒ごとにポーリングし、セットされたら disconnect()"""
+            while True:
+                await asyncio.sleep(0.3)  # v9.3: 0.5秒から0.3秒に短縮
+                if stop and stop.is_set():
+                    print("[LiveBot] 🛑 停止要求を検知 → WebSocket を切断します")
+                    try:
+                        await self.client.disconnect()
+                    except Exception as e:
+                        print(f"[LiveBot] disconnect エラー（無視）: {e}")
+                    break
+
+        watchdog_task = asyncio.create_task(stop_watchdog())
+        try:
+            await self.client.connect()
+        finally:
+            # connect() が返ったら watchdog も不要なのでキャンセル
+            if not watchdog_task.done():
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
+
     # ── メインループ ──────────────────────────────────────────────
 
     async def start(self):
@@ -341,9 +387,7 @@ class LiveBot:
             self._stream_end_fired = False
 
             try:
-                # ★ v9.0 重要修正: start() → connect() に変更
-                # start() は非ブロッキングで Task を返すだけ
-                # connect() は WebSocket が切れるまでブロックする
+                # ★ v9.3: 毎回新規インスタンスを作成（再利用すると内部状態が残り不安定）
                 self.client = TikTokLiveClient(unique_id=f"@{self.username}")
                 self.client.add_listener(ConnectEvent,    self._on_connect)
                 self.client.add_listener(DisconnectEvent, self._on_disconnect)
@@ -351,12 +395,14 @@ class LiveBot:
                 self.client.add_listener(JoinEvent,       self._on_join)
 
                 print(f"[LiveBot] 接続中… (@{self.username})")
-                await self.client.connect()  # ← ここが修正点
+                # ★ v9.2: connect() → _connect_with_stop() に変更
+                # stop_event がセットされると watchdog が disconnect() を呼ぶ
+                await self._connect_with_stop()
                 print(f"[LiveBot] 接続終了 (@{self.username})")
                 rl_count = 0
 
             except Exception as e:
-                err  = str(e)
+                err   = str(e)
                 ename = type(e).__name__
 
                 if _is_rate_limit_error(e):
@@ -386,7 +432,6 @@ class LiveBot:
                     traceback.print_exc()
 
                     if self._stream_started and not self._stream_end_fired:
-                        # 配信中に例外 → 配信終了として処理
                         self._stream_end_fired = True
                         duration = ""
                         if self._start_time:
@@ -409,16 +454,28 @@ class LiveBot:
                             await _sleep_cd(wait, "リトライ待機", self._stop_event)
 
             finally:
-                try:
-                    if self.client:
-                        await self.client.disconnect()
-                except Exception:
-                    pass
-                self.client = None
+                # ★ v9.3: 後片付け: クライアントを確実にクリーンアップ
+                if self.client is not None:
+                    try:
+                        if self.client.connected:
+                            await self.client.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        # HTTPクライアントを適切に閉じる
+                        await self.client.disconnect(close_client=True)
+                    except Exception:
+                        pass
+                    self.client = None
 
             # _on_disconnect で _should_stop が立った場合もここで終了
             if self._should_stop:
                 print("[LiveBot] ✅ 配信終了 – 監視ループ終了")
+                break
+
+            # 停止要求があればここでも終了
+            if self._is_stop_requested():
+                print("[LiveBot] 🛑 ループ終了（接続後停止要求）")
                 break
 
         print("[LiveBot] 監視終了")

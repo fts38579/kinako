@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – 統合アプリ  v2.2  (PyQt6)
+カワウソマネージャー きなこ – 統合アプリ  v2.3  (PyQt6)
 =======================================================
 修正・改善内容:
   [Bug1] ライブ監視: print()出力をGUIログに転送（stdout リダイレクト）
@@ -16,6 +16,10 @@
   [v2.2] LiveBot インスタンス生成後に importlib.reload(config) で config 再注入
   [v2.2] asyncio イベントループのクリーンアップを強化
   [v2.2] build_exe.bat に numpy 追加（matplotlib 依存）
+  [v2.3] Windows で SelectorEventLoop を使用（PyQt6 + asyncio 競合修正）
+  [v2.3] asyncio カスタム例外ハンドラー追加（--windowed EXE クラッシュ修正）
+  [v2.3] asyncio.set_event_loop() 削除（グローバル変数汚染防止）
+  [v2.3] __main__ に multiprocessing.freeze_support() と stderr 対策追加
 """
 
 import os
@@ -233,12 +237,24 @@ class _StdoutRedirector(QObject):
         self._original = original_stdout
 
     def write(self, text):
-        if text.strip():
-            self.text_written.emit(text.rstrip())
-        self._original.write(text)
+        if text and text.strip():
+            try:
+                self.text_written.emit(text.rstrip())
+            except Exception:
+                pass
+        # ★ v2.3: frozen --windowed では _original が None の場合があるので安全化
+        if self._original is not None:
+            try:
+                self._original.write(text)
+            except Exception:
+                pass
 
     def flush(self):
-        self._original.flush()
+        if self._original is not None:
+            try:
+                self._original.flush()
+            except Exception:
+                pass
 
 # ────────────────────────────────────────────────────────────────
 #  設定ユーティリティ
@@ -420,7 +436,6 @@ class LiveWorker(QThread):
                 """配信終了後3分待機してインサイト取得（停止要求時は待機をスキップ）"""
                 self.log_signal.emit("配信終了を検知。3分後にインサイトを自動取得します…")
                 # ★ v2.2 修正: stop_event をチェックしながら待機
-                # 停止ボタンが押された場合は待機をスキップして即時実行
                 waited = 0
                 while waited < 180:
                     if stop.is_set():
@@ -436,20 +451,46 @@ class LiveWorker(QThread):
             # ★ v2.2 修正: LiveBot生成後に config の値を注入（モジュールレベルのキャッシュ対策）
             bot.username = config.MY_TIKTOK_USERNAME
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # ★ v2.3 修正: Windows では SelectorEventLoop を使う（PyQt6 + ProactorEventLoop の競合対策）
+            # ★ v2.3 修正: asyncio.set_event_loop() を削除（グローバル変数を汚染しない）
+            if sys.platform == 'win32':
+                loop = asyncio.SelectorEventLoop()
+            else:
+                loop = asyncio.new_event_loop()
+
+            # ★ v2.3 修正: asyncio 例外ハンドラーをカスタム設定
+            # --windowed ビルドでは sys.stderr=None のためデフォルトハンドラーがクラッシュする
+            def _safe_exception_handler(loop_ref, context):
+                msg = context.get('message', 'asyncio エラー')
+                exc = context.get('exception')
+                err_text = f"[asyncio] {msg}"
+                if exc:
+                    err_text += f": {exc}"
+                try:
+                    self.log_signal.emit(f"⚠️ {err_text}")
+                except Exception:
+                    pass
+
+            loop.set_exception_handler(_safe_exception_handler)
+
             try:
                 loop.run_until_complete(bot.start())
             finally:
-                # ★ v2.2 修正: 残タスクをキャンセルしてループをクリーンに閉じる
+                # ★ 残タスクをキャンセルしてループをクリーンに閉じる
                 try:
-                    pending = asyncio.all_tasks(loop)
+                    pending = {t for t in asyncio.all_tasks(loop)
+                               if not t.done()}
                     if pending:
+                        for t in pending:
+                            t.cancel()
                         loop.run_until_complete(
                             asyncio.gather(*pending, return_exceptions=True))
                 except Exception:
                     pass
-                loop.close()
+                try:
+                    loop.close()
+                except Exception:
+                    pass
 
         except ImportError as ex:
             # ★ Bug-B: 依存ライブラリ未インストール時の詳細メッセージ
@@ -458,12 +499,10 @@ class LiveWorker(QThread):
             self.log_signal.emit("ℹ️ 依存ライブラリが不足しています。")
             self.log_signal.emit("   pip install TikTokLive selenium webdriver-manager を実行してください")
             self.log_signal.emit(f"詳細:\n{tb[:500]}")
-            traceback.print_exc()
         except Exception as ex:
             tb = traceback.format_exc()
             self.log_signal.emit(f"❌ ボットエラー: {ex}")
             self.log_signal.emit(f"詳細:\n{tb[:800]}")
-            traceback.print_exc()
         finally:
             self.status_signal.emit("⏹ 停止中", C_RED)
             self.finished_signal.emit()
@@ -1190,6 +1229,25 @@ class KinakoApp(QMainWindow):
 #  エントリポイント
 # ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # ★ v2.3 修正: PyInstaller frozen exe での multiprocessing 対応
+    # WebDriver (ChromeDriver) が subprocess を使う場合に必要
+    if getattr(sys, 'frozen', False):
+        import multiprocessing
+        multiprocessing.freeze_support()
+
+    # ★ v2.3 修正: Windows で SelectorEventLoop をデフォルトに設定
+    # PyQt6 と asyncio (ProactorEventLoop) の競合を防ぐ
+    if sys.platform == 'win32':
+        import asyncio
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # ★ v2.3 修正: --windowed ビルドでの sys.stderr=None 対策
+    # asyncio / TikTokLive 内部が stderr に書き込もうとしてクラッシュするのを防ぐ
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w')
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w')
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = KinakoApp()
