@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – 統合アプリ  v2.3  (PyQt6)
+カワウソマネージャー きなこ – 統合アプリ  v2.4  (PyQt6)
 =======================================================
 修正・改善内容:
   [Bug1] ライブ監視: print()出力をGUIログに転送（stdout リダイレクト）
@@ -20,6 +20,9 @@
   [v2.3] asyncio カスタム例外ハンドラー追加（--windowed EXE クラッシュ修正）
   [v2.3] asyncio.set_event_loop() 削除（グローバル変数汚染防止）
   [v2.3] __main__ に multiprocessing.freeze_support() と stderr 対策追加
+  [v2.4] live_bot v9.4: connect() → start()+await task に変更（二重await競合解消）
+  [v2.4] live_bot v9.4: finally の二重 disconnect を1回に統合
+  [v2.4] 実際の配信（teketeke1205）で停止フリーズなしを確認済み
 """
 
 import os
@@ -416,15 +419,30 @@ class LiveWorker(QThread):
         self._insight_thread = None
 
     def run(self):
+        # ★ v2.3: クラッシュログをファイルに書き出す（デバッグ用）
+        _log_path = os.path.join(_PROJECT_ROOT, "crash_log.txt")
+        def _write_crash(msg):
+            try:
+                with open(_log_path, "a", encoding="utf-8") as _f:
+                    import datetime
+                    _f.write(f"[{datetime.datetime.now()}] {msg}\n")
+            except Exception:
+                pass
+        _write_crash("LiveWorker.run() 開始")
+
         try:
             import asyncio
             import importlib
             import config
             # ★ Bug-A 修正: スレッド内でも config を最新状態に再読込
+            _write_crash("config import 前")
             importlib.reload(config)
+            _write_crash(f"config reload 完了: username={config.MY_TIKTOK_USERNAME}")
             from modules import live_bot as _lb_mod
+            _write_crash("live_bot import 前")
             importlib.reload(_lb_mod)  # live_bot のモジュールレベル config も更新
             LiveBot = _lb_mod.LiveBot
+            _write_crash("LiveBot クラス取得 OK")
 
             self.log_signal.emit(f"監視ボットを起動しました")
             self.log_signal.emit(f"監視対象: @{config.MY_TIKTOK_USERNAME}")
@@ -447,9 +465,11 @@ class LiveWorker(QThread):
 
             bot = LiveBot(on_stream_end_callback=on_stream_end,
                           stop_event=self._stop)
+            _write_crash("LiveBot インスタンス生成 OK")
 
             # ★ v2.2 修正: LiveBot生成後に config の値を注入（モジュールレベルのキャッシュ対策）
             bot.username = config.MY_TIKTOK_USERNAME
+            _write_crash(f"bot.username = {bot.username}")
 
             # ★ v2.3 修正: Windows では SelectorEventLoop を使う（PyQt6 + ProactorEventLoop の競合対策）
             # ★ v2.3 修正: asyncio.set_event_loop() を削除（グローバル変数を汚染しない）
@@ -472,9 +492,11 @@ class LiveWorker(QThread):
                     pass
 
             loop.set_exception_handler(_safe_exception_handler)
+            _write_crash("asyncio ループ準備完了。bot.start() 呼び出します")
 
             try:
                 loop.run_until_complete(bot.start())
+                _write_crash("bot.start() 正常終了")
             finally:
                 # ★ 残タスクをキャンセルしてループをクリーンに閉じる
                 try:
@@ -495,15 +517,18 @@ class LiveWorker(QThread):
         except ImportError as ex:
             # ★ Bug-B: 依存ライブラリ未インストール時の詳細メッセージ
             tb = traceback.format_exc()
+            _write_crash(f"ImportError: {ex}\n{tb}")
             self.log_signal.emit(f"❌ インポートエラー: {ex}")
             self.log_signal.emit("ℹ️ 依存ライブラリが不足しています。")
             self.log_signal.emit("   pip install TikTokLive selenium webdriver-manager を実行してください")
             self.log_signal.emit(f"詳細:\n{tb[:500]}")
         except Exception as ex:
             tb = traceback.format_exc()
+            _write_crash(f"Exception: {ex}\n{tb}")
             self.log_signal.emit(f"❌ ボットエラー: {ex}")
             self.log_signal.emit(f"詳細:\n{tb[:800]}")
         finally:
+            _write_crash("LiveWorker.run() finally ブロック")
             self.status_signal.emit("⏹ 停止中", C_RED)
             self.finished_signal.emit()
 
