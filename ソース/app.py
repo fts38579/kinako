@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – 統合アプリ  v2.4  (PyQt6)
+カワウソマネージャー きなこ – 統合アプリ  v2.5  (PyQt6)
 =======================================================
 修正・改善内容:
   [Bug1] ライブ監視: print()出力をGUIログに転送（stdout リダイレクト）
@@ -8,14 +8,12 @@
   [Bug3] insights.py で webdriver-manager 対応（Chrome自動検出）
   [Bug4] tkcalendar の月選択不具合 → PyQt6 QDateEdit に置換
   [改善] GUI 全体を tkinter → PyQt6 に移行
-  [改善] グラフにデータポイント・ツールチップ・ズーム対応
   [Bug2/3] live_bot に stop_event を渡して停止ボタンで即座にループ終了
   [Bug3] insights.py で webdriver-manager 対応（Chrome自動検出）
   [v2.2] config.validate() の tkinter 依存を除去（PyQt6 クラッシュ修正）
   [v2.2] on_stream_end 3分待機中も stop_event をチェックして即時終了可能に
   [v2.2] LiveBot インスタンス生成後に importlib.reload(config) で config 再注入
   [v2.2] asyncio イベントループのクリーンアップを強化
-  [v2.2] build_exe.bat に numpy 追加（matplotlib 依存）
   [v2.3] Windows で SelectorEventLoop を使用（PyQt6 + asyncio 競合修正）
   [v2.3] asyncio カスタム例外ハンドラー追加（--windowed EXE クラッシュ修正）
   [v2.3] asyncio.set_event_loop() 削除（グローバル変数汚染防止）
@@ -23,6 +21,8 @@
   [v2.4] live_bot v9.4: connect() → start()+await task に変更（二重await競合解消）
   [v2.4] live_bot v9.4: finally の二重 disconnect を1回に統合
   [v2.4] 実際の配信（teketeke1205）で停止フリーズなしを確認済み
+  [v2.5] グラフエンジンを matplotlib → PyQtGraph に完全移行
+        ズーム・パン・右クリックメニューがマウスで直接操作可能に
 """
 
 import os
@@ -31,7 +31,6 @@ import re
 import time
 import threading
 import traceback
-import io
 from datetime import datetime, timedelta, date
 
 # ── プロジェクトルート解決 ────────────────────────────────────────
@@ -65,14 +64,15 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QFont, QColor, QPalette, QTextCursor
 
-# ── matplotlib (PyQt6バックエンド) ───────────────────────────────
-import matplotlib
-matplotlib.use("QtAgg")
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
+# ── PyQtGraph ────────────────────────────────────────────────────
+import pyqtgraph as pg
+from pyqtgraph import BarGraphItem, PlotWidget, mkPen, mkBrush
 import numpy as np
+
+# PyQtGraph グローバル設定
+pg.setConfigOption("background", "#1e1b2e")   # C_BG
+pg.setConfigOption("foreground", "#e5e7eb")   # C_TEXT
+pg.setConfigOptions(antialias=True)
 
 try:
     import pandas as pd
@@ -80,18 +80,24 @@ try:
 except ImportError:
     _HAS_PANDAS = False
 
-# ── 日本語フォント設定 ───────────────────────────────────────────
-def _set_japanese_font():
-    candidates = ["Meiryo", "MS Gothic", "Yu Gothic", "IPAGothic",
-                  "Noto Sans CJK JP", "TakaoGothic", "IPAPGothic",
-                  "Noto Sans JP", "DejaVu Sans"]
+# ── 日本語フォント設定（PyQtGraph用） ────────────────────────────
+import platform
+def _jp_font_name() -> str:
+    """OSに応じて利用可能な日本語フォントを返す"""
+    sys_fonts = {
+        "Windows": ["Meiryo", "Yu Gothic", "MS Gothic"],
+        "Darwin":  ["Hiragino Sans", "Hiragino Kaku Gothic ProN"],
+        "Linux":   ["Noto Sans CJK JP", "IPAGothic", "TakaoGothic"],
+    }
+    candidates = sys_fonts.get(platform.system(), []) + ["DejaVu Sans"]
+    from PyQt6.QtGui import QFontDatabase
+    available = set(QFontDatabase.families())
     for name in candidates:
-        for f in fm.fontManager.ttflist:
-            if name.lower() in f.name.lower():
-                matplotlib.rcParams["font.family"] = f.name
-                return
-_set_japanese_font()
-matplotlib.rcParams["axes.unicode_minus"] = False
+        if name in available:
+            return name
+    return "DejaVu Sans"
+
+_JP_FONT = _jp_font_name()
 
 # ────────────────────────────────────────────────────────────────
 #  カラーパレット（ダークテーマ）
@@ -379,31 +385,95 @@ def load_viewers():
         return None, str(e)
 
 # ────────────────────────────────────────────────────────────────
-#  ダークテーマ用 matplotlib Figure 生成ヘルパー
+#  PyQtGraph グラフ共通ユーティリティ
 # ────────────────────────────────────────────────────────────────
-def _dark_fig(nrows=1, ncols=1, figsize=(12, 5)):
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize,
-                             facecolor=C_BG)
-    for ax in (axes.flat if hasattr(axes, "flat") else [axes]):
-        ax.set_facecolor(C_PANEL)
-        ax.tick_params(colors=C_SUBTEXT, labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color(C_BORDER)
-        ax.title.set_color("#c4b5fd")
-        ax.xaxis.label.set_color(C_SUBTEXT)
-        ax.yaxis.label.set_color(C_SUBTEXT)
-    return fig, axes
 
-def _annotate_bars(ax, vals, color="white", fmt="{:.0f}"):
-    """棒グラフの上に値ラベルを表示"""
-    for i, v in enumerate(vals):
-        ax.text(i, v * 1.01, fmt.format(v),
-                ha="center", va="bottom", fontsize=7,
-                color=color, fontweight="bold")
+def _make_plot_widget(title: str = "") -> pg.PlotWidget:
+    """ダークテーマ済み PlotWidget を生成"""
+    pw = pg.PlotWidget(title=f"<span style='color:#c4b5fd;font-size:10pt'>{title}</span>")
+    pw.setBackground("#1e1b2e")
+    pw.getPlotItem().getAxis("bottom").setPen(pg.mkPen(C_BORDER))
+    pw.getPlotItem().getAxis("left").setPen(pg.mkPen(C_BORDER))
+    pw.getPlotItem().getAxis("bottom").setTextPen(pg.mkPen(C_SUBTEXT))
+    pw.getPlotItem().getAxis("left").setTextPen(pg.mkPen(C_SUBTEXT))
+    pw.showGrid(x=False, y=True, alpha=0.2)
+    return pw
 
-def _add_data_points(ax, x, y, color):
-    """折れ線に加えてデータポイントをプロット"""
-    ax.plot(x, y, "o", color=color, markersize=5, zorder=5)
+
+def _set_x_labels(pw: pg.PlotWidget, labels: list):
+    """棒グラフの X 軸に文字列ラベルを設定（日付など）"""
+    ticks = [(i, lbl) for i, lbl in enumerate(labels)]
+    ax = pw.getPlotItem().getAxis("bottom")
+    ax.setTicks([ticks])
+
+
+def _bar_graph(pw: pg.PlotWidget, values: list, color: str,
+               labels: list | None = None, show_mean: bool = True):
+    """縦棒グラフを描画してデータポイントを重ねる"""
+    pw.clear()
+    n = len(values)
+    if n == 0:
+        return
+
+    x = list(range(n))
+    bar = pg.BarGraphItem(x=x, height=values, width=0.6,
+                          brush=pg.mkBrush(color + "cc"),
+                          pen=pg.mkPen(color))
+    pw.addItem(bar)
+
+    # データポイント
+    pw.plot(x, values, pen=None,
+            symbol="o", symbolSize=7,
+            symbolBrush=pg.mkBrush("white"),
+            symbolPen=pg.mkPen("white"))
+
+    # 値ラベル
+    for xi, v in zip(x, values):
+        txt = pg.TextItem(text=f"{int(v)}", color="white", anchor=(0.5, 1.0))
+        txt.setFont(pg.QtGui.QFont(_JP_FONT, 7))
+        txt.setPos(xi, v)
+        pw.addItem(txt)
+
+    # 平均線
+    if show_mean and n > 0:
+        mean_v = float(np.mean(values))
+        inf_line = pg.InfiniteLine(
+            pos=mean_v, angle=0,
+            pen=pg.mkPen("red", width=1.5, style=pg.QtCore.Qt.PenStyle.DashLine),
+            label=f"平均: {mean_v:.1f}",
+            labelOpts={"color": "red", "position": 0.95,
+                       "font": pg.QtGui.QFont(_JP_FONT, 8)}
+        )
+        pw.addItem(inf_line)
+
+    if labels:
+        _set_x_labels(pw, labels)
+
+
+def _barh_graph(pw: pg.PlotWidget, values: list, labels: list, color: str):
+    """横棒グラフを描画（Top10 ランキング用）"""
+    pw.clear()
+    n = len(values)
+    if n == 0:
+        return
+
+    y = list(range(n))
+    for yi, v in zip(y, values):
+        bar = pg.BarGraphItem(x=[0], x1=[v], y=[yi - 0.3], y1=[yi + 0.3],
+                              brush=pg.mkBrush(color + "cc"),
+                              pen=pg.mkPen(color))
+        pw.addItem(bar)
+
+    # 値ラベル
+    for yi, v in zip(y, values):
+        txt = pg.TextItem(text=str(int(v)), color="white", anchor=(0.0, 0.5))
+        txt.setFont(pg.QtGui.QFont(_JP_FONT, 7))
+        txt.setPos(v * 1.02 if v > 0 else 0.1, yi)
+        pw.addItem(txt)
+
+    ticks = [(i, lbl) for i, lbl in enumerate(labels)]
+    pw.getPlotItem().getAxis("left").setTicks([ticks])
+    pw.getPlotItem().getAxis("bottom").setLabel("回数", color=C_SUBTEXT)
 
 # ────────────────────────────────────────────────────────────────
 #  ライブ監視ワーカースレッド  [Bug1 / Bug2 修正]
@@ -570,10 +640,10 @@ class KinakoApp(QMainWindow):
         self._bot_stop_event = threading.Event()
         self._live_worker: LiveWorker | None = None
 
-        # グラフキャッシュ
-        self._insight_fig = self._insight_df = None
-        self._gift_fig    = self._gift_df    = None
-        self._repeat_fig  = self._repeat_df  = None
+        # グラフキャッシュ（PyQtGraph は PlotWidget を直接保持するため fig は不要）
+        self._insight_df = None
+        self._gift_df    = None
+        self._repeat_df  = None
 
         self._build_ui()
 
@@ -945,10 +1015,20 @@ class KinakoApp(QMainWindow):
         lay = QVBoxLayout(self._rtab_insight)
         lay.setContentsMargins(8, 8, 8, 8)
         self._de_ins_start, self._de_ins_end = self._make_ctrl_row(lay, self._on_show_insights)
-        self._canvas_ins = None
-        self._frame_ins  = QWidget()
-        self._frame_ins.setLayout(QVBoxLayout())
-        lay.addWidget(self._frame_ins, stretch=1)
+
+        # 2×2 グリッドに PlotWidget を配置
+        grid = QWidget()
+        gl = QGridLayout(grid)
+        gl.setSpacing(6)
+        self._pw_ins = [
+            _make_plot_widget("最高同時視聴者数（人）"),
+            _make_plot_widget("ダイヤ数"),
+            _make_plot_widget("ギフト贈呈者数（人）"),
+            _make_plot_widget("平均視聴時間"),
+        ]
+        for i, pw in enumerate(self._pw_ins):
+            gl.addWidget(pw, i // 2, i % 2)
+        lay.addWidget(grid, stretch=1)
 
     def _on_show_insights(self):
         df, err = load_insights()
@@ -967,55 +1047,43 @@ class KinakoApp(QMainWindow):
         for col in [col_peak, col_diamond, col_gifter, col_watch]:
             if col: df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        diamond_total = int(df[col_diamond].sum(skipna=True)) if col_diamond else 0
-        plt.close("all")
-        fig, axes = _dark_fig(2, 2, (11, 7))
-        title = (f"インサイト（{self._de_ins_start.date().toString('yyyy-MM-dd')} "
-                 f"～ {self._de_ins_end.date().toString('yyyy-MM-dd')}）"
-                 f"  ◆ 期間合計ダイヤ: {diamond_total:,}")
-        fig.suptitle(title, fontsize=10, y=0.99, color=C_TEXT)
+        labels = (df["_date"].dt.strftime("%m/%d").tolist()
+                  if "_date" in df.columns else [str(i) for i in range(len(df))])
 
-        plot_cfgs = [
-            (axes[0][0], col_peak,    "#4f86c6", "最高同時視聴者数（人）"),
-            (axes[0][1], col_diamond, "#f5a623", "ダイヤ数"),
-            (axes[1][0], col_gifter,  "#7ed321", "ギフト贈呈者数（人）"),
-            (axes[1][1], col_watch,   "#e87c7c", "平均視聴時間"),
+        cfgs = [
+            (self._pw_ins[0], col_peak,    "#4f86c6"),
+            (self._pw_ins[1], col_diamond, "#f5a623"),
+            (self._pw_ins[2], col_gifter,  "#7ed321"),
+            (self._pw_ins[3], col_watch,   "#e87c7c"),
         ]
-        for ax, col, color, ylabel in plot_cfgs:
+        for pw, col, color in cfgs:
             if col and col in df.columns:
-                mask = df[col].notna()
-                vals = df.loc[mask, col]
-                labels = (df.loc[mask,"_date"].dt.strftime("%m/%d")
-                          if "_date" in df.columns else range(len(vals)))
-                if not vals.empty:
-                    x = range(len(vals))
-                    ax.bar(x, vals, color=color, alpha=0.8)
-                    _annotate_bars(ax, vals.tolist(), color="white")
-                    _add_data_points(ax, list(x), vals.tolist(), "white")
-                    ax.set_xticks(list(x))
-                    ax.set_xticklabels(list(labels), rotation=45, fontsize=8)
-                    ax.set_ylabel(ylabel, fontsize=9)
-                    mean_val = vals.mean()
-                    ax.axhline(mean_val, color="red", linestyle="--", lw=1.2,
-                               label=f"平均: {mean_val:.1f}")
-                    ax.legend(fontsize=8, facecolor=C_PANEL, labelcolor=C_TEXT)
+                vals = df[col].fillna(0).tolist()
+                _bar_graph(pw, vals, color, labels)
             else:
-                ax.text(0.5,0.5,"データなし",ha="center",va="center",
-                        transform=ax.transAxes, color=C_SUBTEXT, fontsize=11)
-            ax.set_title(ylabel, fontsize=10)
-        plt.tight_layout(rect=[0,0,1,0.96])
+                pw.clear()
+                pw.addItem(pg.TextItem("データなし", color=C_SUBTEXT,
+                                       anchor=(0.5, 0.5)))
 
-        self._insight_fig = fig
-        self._insight_df  = df
-        self._replace_canvas(self._frame_ins, fig)
+        self._insight_df = df
 
     # ── ギフトレポート ──
     def _build_gift_report(self):
         lay = QVBoxLayout(self._rtab_gift)
         lay.setContentsMargins(8, 8, 8, 8)
         self._de_gift_start, self._de_gift_end = self._make_ctrl_row(lay, self._on_show_gift)
-        self._frame_gift = QWidget(); self._frame_gift.setLayout(QVBoxLayout())
-        lay.addWidget(self._frame_gift, stretch=1)
+
+        row = QWidget()
+        rl  = QHBoxLayout(row)
+        rl.setSpacing(6)
+        self._pw_gift_hourly  = _make_plot_widget("時間帯別ギフト回数")
+        self._pw_gift_top     = _make_plot_widget("トップギフター Top10")
+        self._pw_gift_type    = _make_plot_widget("ギフト種別 Top10")
+        # 時間帯グラフはやや広め
+        self._pw_gift_hourly.setMinimumWidth(300)
+        for pw in (self._pw_gift_hourly, self._pw_gift_top, self._pw_gift_type):
+            rl.addWidget(pw)
+        lay.addWidget(row, stretch=1)
 
     def _on_show_gift(self):
         df, err = load_gifts()
@@ -1026,61 +1094,58 @@ class KinakoApp(QMainWindow):
         df_r = df[(df["_date"].dt.date >= s) & (df["_date"].dt.date <= e)].copy()
         if df_r.empty: return
 
-        plt.close("all")
-        fig, axes = _dark_fig(1, 3, (14, 5))
-        ug = df_r["user"].nunique() if "user" in df_r.columns else 0
-        fig.suptitle(
-            f"ギフトタイムライン  ◆ ギフター: {ug}人  |  ギフト回数: {len(df_r)}回",
-            fontsize=10, color=C_TEXT)
-
-        ax1, ax2, ax3 = axes
-
         # 時間帯別
+        self._pw_gift_hourly.clear()
         if "_date" in df_r.columns:
             df_r["hour"] = df_r["_date"].dt.hour
             hourly = df_r.groupby("hour").size()
-            ax1.bar(hourly.index, hourly.values, color="#f5a623", alpha=0.85)
-            _annotate_bars(ax1, hourly.values.tolist())
-            ax1.set_xlabel("時刻（時）",  fontsize=9)
-            ax1.set_ylabel("ギフト回数",  fontsize=9)
-        ax1.set_title("時間帯別ギフト回数", fontsize=10)
+            hours  = hourly.index.tolist()
+            vals   = hourly.values.tolist()
+            bar = pg.BarGraphItem(x=hours, height=vals, width=0.6,
+                                  brush=pg.mkBrush("#f5a623cc"),
+                                  pen=pg.mkPen("#f5a623"))
+            self._pw_gift_hourly.addItem(bar)
+            for xi, v in zip(hours, vals):
+                t = pg.TextItem(str(v), color="white", anchor=(0.5, 1.0))
+                t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
+                t.setPos(xi, v)
+                self._pw_gift_hourly.addItem(t)
+            self._pw_gift_hourly.getPlotItem().getAxis("bottom").setLabel("時刻（時）", color=C_SUBTEXT)
+            self._pw_gift_hourly.getPlotItem().getAxis("left").setLabel("ギフト回数", color=C_SUBTEXT)
 
         # トップギフター
+        self._pw_gift_top.clear()
         if "user" in df_r.columns:
-            tg = df_r.groupby("user").size().nlargest(10)
-            y_pos = range(len(tg))
-            ax2.barh(list(y_pos), tg.values[::-1], color="#7ed321", alpha=0.85)
-            ax2.set_yticks(list(y_pos))
-            ax2.set_yticklabels(list(tg.index[::-1]), fontsize=8)
-            for i, v in enumerate(tg.values[::-1]):
-                ax2.text(v*1.01, i, str(v), va="center", fontsize=7, color="white")
-            ax2.set_xlabel("ギフト回数", fontsize=9)
-        ax2.set_title("トップギフター Top10", fontsize=10)
+            tg   = df_r.groupby("user").size().nlargest(10)
+            lbls = tg.index.tolist()[::-1]
+            vals = tg.values.tolist()[::-1]
+            _barh_graph(self._pw_gift_top, vals, lbls, "#7ed321")
 
         # ギフト種別
+        self._pw_gift_type.clear()
         if "gift_name" in df_r.columns:
-            tgt = df_r.groupby("gift_name")["count"].sum().nlargest(10)
-            y_pos = range(len(tgt))
-            ax3.barh(list(y_pos), tgt.values[::-1], color="#4f86c6", alpha=0.85)
-            ax3.set_yticks(list(y_pos))
-            ax3.set_yticklabels(list(tgt.index[::-1]), fontsize=8)
-            for i, v in enumerate(tgt.values[::-1]):
-                ax3.text(v*1.01, i, str(v), va="center", fontsize=7, color="white")
-            ax3.set_xlabel("合計個数", fontsize=9)
-        ax3.set_title("ギフト種別 Top10", fontsize=10)
+            tgt  = df_r.groupby("gift_name")["count"].sum().nlargest(10)
+            lbls = tgt.index.tolist()[::-1]
+            vals = tgt.values.tolist()[::-1]
+            _barh_graph(self._pw_gift_type, vals, lbls, "#4f86c6")
 
-        plt.tight_layout(rect=[0,0,1,0.94])
-        self._gift_fig = fig
-        self._gift_df  = df_r
-        self._replace_canvas(self._frame_gift, fig)
+        self._gift_df = df_r
 
     # ── リピート率レポート ──
     def _build_repeat_report(self):
         lay = QVBoxLayout(self._rtab_repeat)
         lay.setContentsMargins(8, 8, 8, 8)
         self._de_rep_start, self._de_rep_end = self._make_ctrl_row(lay, self._on_show_repeat)
-        self._frame_rep = QWidget(); self._frame_rep.setLayout(QVBoxLayout())
-        lay.addWidget(self._frame_rep, stretch=1)
+
+        row = QWidget()
+        rl  = QHBoxLayout(row)
+        rl.setSpacing(6)
+        self._pw_rep_pie      = _make_plot_widget("リピーター比率")
+        self._pw_rep_session  = _make_plot_widget("セッション別ユニーク視聴者")
+        self._pw_rep_top      = _make_plot_widget("リピーター Top10")
+        for pw in (self._pw_rep_pie, self._pw_rep_session, self._pw_rep_top):
+            rl.addWidget(pw)
+        lay.addWidget(row, stretch=1)
 
     def _on_show_repeat(self):
         df, err = load_viewers()
@@ -1096,98 +1161,77 @@ class KinakoApp(QMainWindow):
         name_col = "display_name" if "display_name" in df.columns else None
         if uid_col is None: return
 
-        sc       = df.groupby(uid_col)["session_date"].nunique()
-        total    = len(sc)
-        repeats  = int((sc >= 2).sum())
-        rate     = repeats / total * 100 if total > 0 else 0.0
-        sv       = df.groupby("session_date")[uid_col].nunique().sort_index()
-        top_r    = sc[sc >= 2].nlargest(10)
-        top_lbl  = ([df.drop_duplicates(uid_col).set_index(uid_col)[name_col].get(u,str(u))
-                     for u in top_r.index]
-                    if name_col else [str(u) for u in top_r.index])
+        sc      = df.groupby(uid_col)["session_date"].nunique()
+        total   = len(sc)
+        repeats = int((sc >= 2).sum())
+        rate    = repeats / total * 100 if total > 0 else 0.0
+        sv      = df.groupby("session_date")[uid_col].nunique().sort_index()
+        top_r   = sc[sc >= 2].nlargest(10)
+        top_lbl = ([df.drop_duplicates(uid_col).set_index(uid_col)[name_col].get(u, str(u))
+                    for u in top_r.index]
+                   if name_col else [str(u) for u in top_r.index])
 
-        plt.close("all")
-        fig, axes = _dark_fig(1, 3, (14, 5))
-        fig.suptitle(
-            f"リピート率レポート  |  ユニーク視聴者: {total}人  "
-            f"リピーター: {repeats}人  リピート率: {rate:.1f}%",
-            fontsize=10, color=C_TEXT)
-
-        ax0, ax1, ax2 = axes
-
-        # 円グラフ
-        ax0.set_title("リピーター比率", fontsize=10)
+        # --- 比率グラフ（棒グラフで代替。PyQtGraph は円グラフ非対応）---
+        self._pw_rep_pie.clear()
         if total > 0:
-            ax0.pie([repeats, total - repeats],
-                    labels=[f"リピーター\n{repeats}人", f"初回のみ\n{total-repeats}人"],
-                    colors=[C_ACCENT, "#c4b5fd"],
-                    autopct="%1.1f%%", startangle=90,
-                    textprops={"fontsize":10,"color":C_TEXT})
+            bar_pie = pg.BarGraphItem(
+                x=[0, 1],
+                height=[repeats, total - repeats],
+                width=0.5,
+                brushes=[pg.mkBrush(C_ACCENT + "cc"), pg.mkBrush("#c4b5fd" + "cc")],
+                pens=[pg.mkPen(C_ACCENT), pg.mkPen("#c4b5fd")]
+            )
+            self._pw_rep_pie.addItem(bar_pie)
+            for xi, v, lbl in zip([0, 1],
+                                   [repeats, total - repeats],
+                                   [f"リピーター\n{repeats}人\n{rate:.1f}%",
+                                    f"初回のみ\n{total-repeats}人"]):
+                t = pg.TextItem(lbl, color="white", anchor=(0.5, 1.0))
+                t.setFont(pg.QtGui.QFont(_JP_FONT, 8))
+                t.setPos(xi, v)
+                self._pw_rep_pie.addItem(t)
+            ticks = [(0, "リピーター"), (1, "初回のみ")]
+            self._pw_rep_pie.getPlotItem().getAxis("bottom").setTicks([ticks])
+            self._pw_rep_pie.setTitle(
+                f"<span style='color:#c4b5fd;font-size:10pt'>"
+                f"リピーター比率　ユニーク視聴者: {total}人 / "
+                f"リピーター: {repeats}人 / {rate:.1f}%</span>")
 
         # セッション別ユニーク視聴者
-        ax1.set_title("セッション別ユニーク視聴者", fontsize=10)
         if not sv.empty:
             dates = [str(d) for d in sv.index]
-            x = range(len(dates))
-            ax1.bar(x, sv.values, color="#4f86c6", alpha=0.85)
-            _annotate_bars(ax1, sv.values.tolist())
-            _add_data_points(ax1, list(x), sv.values.tolist(), "white")
-            ax1.set_xticks(list(x))
-            ax1.set_xticklabels(dates, rotation=45, fontsize=8)
-            ax1.set_ylabel("ユニーク視聴者数（人）", fontsize=9)
-            mean_v = sv.mean()
-            ax1.axhline(mean_v, color="red", linestyle="--", lw=1.2,
-                        label=f"平均: {mean_v:.1f}")
-            ax1.legend(fontsize=8, facecolor=C_PANEL, labelcolor=C_TEXT)
+            _bar_graph(self._pw_rep_session, sv.values.tolist(), "#4f86c6", dates)
 
         # リピーター Top10
-        ax2.set_title("リピーター Top10（参加セッション数）", fontsize=10)
         if len(top_r) > 0:
-            y_pos = range(len(top_r))
-            ax2.barh(list(y_pos), top_r.values[::-1], color="#7ed321", alpha=0.85)
-            ax2.set_yticks(list(y_pos))
-            ax2.set_yticklabels(top_lbl[::-1], fontsize=8)
-            for i, v in enumerate(top_r.values[::-1]):
-                ax2.text(v*1.01, i, str(v), va="center", fontsize=7, color="white")
-            ax2.set_xlabel("参加セッション数", fontsize=9)
+            _barh_graph(self._pw_rep_top,
+                        top_r.values.tolist()[::-1],
+                        top_lbl[::-1],
+                        "#7ed321")
+            self._pw_rep_top.getPlotItem().getAxis("bottom").setLabel(
+                "参加セッション数", color=C_SUBTEXT)
 
-        plt.tight_layout(rect=[0,0,1,0.94])
-        self._repeat_fig = fig
-        self._repeat_df  = df
-        self._replace_canvas(self._frame_rep, fig)
-
-    def _replace_canvas(self, frame: QWidget, fig):
-        """フレーム内の既存キャンバスを新しいFigureで置き換える"""
-        lay = frame.layout()
-        while lay.count():
-            item = lay.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        canvas = FigureCanvas(fig)
-        canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        lay.addWidget(canvas)
-        canvas.draw()
+        self._repeat_df = df
 
     # ─────────────────────────────────────────────────────────
     #  エクスポート
     # ─────────────────────────────────────────────────────────
     def _get_current_report(self):
         idx = self._report_sub_tabs.currentIndex() if hasattr(self, "_report_sub_tabs") else -1
-        if idx == 0: return self._insight_fig, self._insight_df, \
+        if idx == 0: return self._insight_df, \
             f"インサイト_{self._de_ins_start.date().toString('yyyyMMdd')}"
-        if idx == 1: return self._gift_fig, self._gift_df, \
+        if idx == 1: return self._gift_df, \
             f"ギフト_{self._de_gift_start.date().toString('yyyyMMdd')}"
-        if idx == 2: return self._repeat_fig, self._repeat_df, "リピート率レポート"
-        return None, None, ""
+        if idx == 2: return self._repeat_df, "リピート率レポート"
+        return None, ""
 
     def _on_export_excel(self):
-        fig, df, title = self._get_current_report()
-        if fig is None or df is None:
+        df, title = self._get_current_report()
+        if df is None:
             QMessageBox.warning(self, "未表示",
                 "先にレポートタブでグラフを表示してください。"); return
         try:
             import openpyxl
-            from openpyxl.drawing.image import Image as XLImage
         except ImportError:
             QMessageBox.critical(self, "ライブラリエラー",
                 "openpyxl が必要です: pip install openpyxl"); return
@@ -1203,18 +1247,13 @@ class KinakoApp(QMainWindow):
                     out[c] = out[c].astype(str)
             ws.append(list(out.columns))
             for row in out.itertuples(index=False): ws.append(list(row))
-            wc = wb.create_sheet("グラフ")
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-            buf.seek(0)
-            wc.add_image(XLImage(buf), "A1")
             wb.save(path)
             QMessageBox.information(self, "保存完了", f"保存しました:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
 
     def _on_export_csv(self):
-        fig, df, title = self._get_current_report()
+        df, title = self._get_current_report()
         if df is None:
             QMessageBox.warning(self, "未表示",
                 "先にレポートタブでグラフを表示してください。"); return
@@ -1242,7 +1281,6 @@ class KinakoApp(QMainWindow):
                 event.ignore(); return
         self._bot_stop_event.set()
         sys.stdout = self._redirector._original
-        plt.close("all")
         event.accept()
 
 
