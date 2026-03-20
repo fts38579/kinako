@@ -68,11 +68,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette, QTextCursor
 import pyqtgraph as pg
 from pyqtgraph import BarGraphItem, PlotWidget, mkPen, mkBrush
 import numpy as np
-
-# PyQtGraph グローバル設定
-pg.setConfigOption("background", "#1e1b2e")   # C_BG
-pg.setConfigOption("foreground", "#e5e7eb")   # C_TEXT
-pg.setConfigOptions(antialias=True)
+import platform
 
 try:
     import pandas as pd
@@ -80,10 +76,18 @@ try:
 except ImportError:
     _HAS_PANDAS = False
 
-# ── 日本語フォント設定（PyQtGraph用） ────────────────────────────
-import platform
-def _jp_font_name() -> str:
-    """OSに応じて利用可能な日本語フォントを返す"""
+# ── PyQtGraph / フォント初期化（QApplication生成後に必ず呼ぶ） ──
+_JP_FONT = "MS Gothic"  # デフォルト。_init_pyqtgraph() で上書きされる
+
+def _init_pyqtgraph():
+    """QApplication 生成後に一度だけ呼ぶ。
+    pg.setConfigOption は QApplication より前に呼ぶとクラッシュする。"""
+    global _JP_FONT
+    # PyQtGraph グローバル設定
+    pg.setConfigOption("background", "#1e1b2e")
+    pg.setConfigOption("foreground", "#e5e7eb")
+    pg.setConfigOptions(antialias=True)
+    # 日本語フォント選択
     sys_fonts = {
         "Windows": ["Meiryo", "Yu Gothic", "MS Gothic"],
         "Darwin":  ["Hiragino Sans", "Hiragino Kaku Gothic ProN"],
@@ -94,10 +98,9 @@ def _jp_font_name() -> str:
     available = set(QFontDatabase.families())
     for name in candidates:
         if name in available:
-            return name
-    return "DejaVu Sans"
-
-_JP_FONT = _jp_font_name()
+            _JP_FONT = name
+            return
+    _JP_FONT = "DejaVu Sans"
 
 # ────────────────────────────────────────────────────────────────
 #  カラーパレット（ダークテーマ）
@@ -1309,6 +1312,7 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    _init_pyqtgraph()   # ★ QApplication 生成後に PyQtGraph を初期化
     window = KinakoApp()
     window.show()
     sys.exit(app.exec())
