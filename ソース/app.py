@@ -451,17 +451,8 @@ class LiveWorker(QThread):
             stop = self._stop  # ローカル参照（クロージャ用）
 
             def on_stream_end():
-                """配信終了後3分待機してインサイト取得（停止要求時は待機をスキップ）"""
-                self.log_signal.emit("配信終了を検知。3分後にインサイトを自動取得します…")
-                # ★ v2.2 修正: stop_event をチェックしながら待機
-                waited = 0
-                while waited < 180:
-                    if stop.is_set():
-                        self.log_signal.emit("停止要求を検知。待機をスキップしてインサイト取得を開始します")
-                        break
-                    time.sleep(5)
-                    waited += 5
-                self._run_insights()
+                """配信終了検知時のコールバック（インサイト自動取得は行わない）"""
+                self.log_signal.emit("配信終了を検知しました")
 
             bot = LiveBot(on_stream_end_callback=on_stream_end,
                           stop_event=self._stop)
@@ -789,15 +780,11 @@ class KinakoApp(QMainWindow):
             f"color:{color}; font-weight:bold; font-size:11pt;")
 
     def _on_live_stop(self):
-        """停止ボタン：stop_eventをセットし、直ちにインサイト取得も開始 [Bug2修正]"""
+        """停止ボタン：stop_event をセットして監視を終了"""
         self._bot_stop_event.set()
         self._btn_stop.setEnabled(False)
         self._set_status("⏸ 停止中…", "#f59e0b")
         self._append_log("停止リクエストを送信しました")
-
-        # 配信中に手動停止した場合もインサイト取得を起動
-        if self._live_worker and self._live_worker.isRunning():
-            self._live_worker.trigger_insight_now()
 
     @pyqtSlot()
     def _on_bot_finished(self):
