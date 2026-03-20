@@ -451,8 +451,17 @@ class LiveWorker(QThread):
             stop = self._stop  # ローカル参照（クロージャ用）
 
             def on_stream_end():
-                """配信終了検知時のコールバック（インサイト自動取得は行わない）"""
-                self.log_signal.emit("配信終了を検知しました")
+                """配信側が配信終了したときに自動でインサイト取得を実行"""
+                self.log_signal.emit("配信終了を検知。3分後にインサイトを自動取得します…")
+                # 3分待機（stop_event がセットされた＝手動停止の場合はスキップ）
+                waited = 0
+                while waited < 180:
+                    if stop.is_set():
+                        self.log_signal.emit("手動停止のためインサイト自動取得をスキップします")
+                        return
+                    time.sleep(5)
+                    waited += 5
+                self._run_insights()
 
             bot = LiveBot(on_stream_end_callback=on_stream_end,
                           stop_event=self._stop)
