@@ -10,7 +10,7 @@ echo ============================================================
 echo.
 
 echo [Step 0] Installing required libraries...
-py -m pip install pyinstaller PyQt6 pyqtgraph matplotlib pandas openpyxl ^
+py -m pip install pyinstaller PyQt6 pyqtgraph matplotlib numpy pandas openpyxl ^
     selenium webdriver-manager TikTokLive beautifulsoup4 --quiet
 if %ERRORLEVEL% neq 0 ( echo [ERROR] pip install failed & pause & exit /b 1 )
 echo [OK] Libraries ready.
@@ -28,6 +28,7 @@ py -m PyInstaller --onefile --windowed ^
   --hidden-import webdriver_manager ^
   --hidden-import webdriver_manager.chrome ^
   --hidden-import pandas ^
+  --hidden-import numpy ^
   --hidden-import openpyxl ^
   --hidden-import PyQt6 ^
   --hidden-import PyQt6.QtWidgets ^
@@ -39,6 +40,7 @@ py -m PyInstaller --onefile --windowed ^
   --collect-all webdriver_manager ^
   --collect-all bs4 ^
   --collect-all matplotlib ^
+  --collect-all numpy ^
   --collect-all PyQt6 ^
   app.py
 if %ERRORLEVEL% neq 0 ( echo [ERROR] Build failed & pause & exit /b 1 )

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – 統合アプリ  v2.1  (PyQt6)
+カワウソマネージャー きなこ – 統合アプリ  v2.2  (PyQt6)
 =======================================================
 修正・改善内容:
   [Bug1] ライブ監視: print()出力をGUIログに転送（stdout リダイレクト）
@@ -11,6 +11,11 @@
   [改善] グラフにデータポイント・ツールチップ・ズーム対応
   [Bug2/3] live_bot に stop_event を渡して停止ボタンで即座にループ終了
   [Bug3] insights.py で webdriver-manager 対応（Chrome自動検出）
+  [v2.2] config.validate() の tkinter 依存を除去（PyQt6 クラッシュ修正）
+  [v2.2] on_stream_end 3分待機中も stop_event をチェックして即時終了可能に
+  [v2.2] LiveBot インスタンス生成後に importlib.reload(config) で config 再注入
+  [v2.2] asyncio イベントループのクリーンアップを強化
+  [v2.2] build_exe.bat に numpy 追加（matplotlib 依存）
 """
 
 import os
@@ -401,27 +406,49 @@ class LiveWorker(QThread):
             import config
             # ★ Bug-A 修正: スレッド内でも config を最新状態に再読込
             importlib.reload(config)
-            from modules.live_bot import LiveBot
+            from modules import live_bot as _lb_mod
+            importlib.reload(_lb_mod)  # live_bot のモジュールレベル config も更新
+            LiveBot = _lb_mod.LiveBot
 
             self.log_signal.emit(f"監視ボットを起動しました")
             self.log_signal.emit(f"監視対象: @{config.MY_TIKTOK_USERNAME}")
             self.status_signal.emit("🟢 監視中", C_GREEN)
 
+            stop = self._stop  # ローカル参照（クロージャ用）
+
             def on_stream_end():
+                """配信終了後3分待機してインサイト取得（停止要求時は待機をスキップ）"""
                 self.log_signal.emit("配信終了を検知。3分後にインサイトを自動取得します…")
-                for remaining in range(180, 0, -10):
-                    time.sleep(10)
-                    # 停止要求があっても3分待機後にインサイト取得は実行する
-                    # （停止ボタン押下時も取得する仕様）
+                # ★ v2.2 修正: stop_event をチェックしながら待機
+                # 停止ボタンが押された場合は待機をスキップして即時実行
+                waited = 0
+                while waited < 180:
+                    if stop.is_set():
+                        self.log_signal.emit("停止要求を検知。待機をスキップしてインサイト取得を開始します")
+                        break
+                    time.sleep(5)
+                    waited += 5
                 self._run_insights()
 
             bot = LiveBot(on_stream_end_callback=on_stream_end,
                           stop_event=self._stop)
+
+            # ★ v2.2 修正: LiveBot生成後に config の値を注入（モジュールレベルのキャッシュ対策）
+            bot.username = config.MY_TIKTOK_USERNAME
+
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
                 loop.run_until_complete(bot.start())
             finally:
+                # ★ v2.2 修正: 残タスクをキャンセルしてループをクリーンに閉じる
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    if pending:
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True))
+                except Exception:
+                    pass
                 loop.close()
 
         except ImportError as ex:
