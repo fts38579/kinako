@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – LiveBot  v9.3
+カワウソマネージャー きなこ – LiveBot  v9.4
 変更:
   v8.8: _gift_last を __init__ に移動（競合リスク解消）
   v8.9: stop_event 連携追加（GUI停止ボタンでループ終了）
@@ -24,6 +24,14 @@
         [修正] start() の直前に stop_event チェックを追加（高速応答）
         [修正] _connect_with_stop() の watchdog 間隔を 0.3 秒に短縮
         [修正] start()内の finally で client を確実にクリーンアップ
+  v9.4: [根本修正2] connect() の代わりに start() + await task を使用
+        ─ 問題: connect() は内部で start() + await task を行い、
+                watchdog が disconnect() を呼ぶと disconnect() も await task する
+                → 同じ task を 2 箇所から await する二重 await 競合が発生し不安定
+        ─ 修正: _connect_with_stop() で client.start() を直接呼び
+                返ってきた task を await する。watchdog は disconnect() ではなく
+                task.cancel() で停止（より安全）
+        [修正] finally の二重 disconnect を1回にまとめ (close_client=True)
 """
 
 import sys
@@ -327,38 +335,54 @@ class LiveBot:
         except Exception as e:
             print(f"[Join] 処理エラー: {e}")
 
-    # ── ★ v9.2/v9.3 核心修正: stop_event 対応の接続メソッド ─────────────
+    # ── ★ v9.4 核心修正2: stop_event 対応の接続メソッド ─────────────────
     async def _connect_with_stop(self) -> None:
         """
-        connect() と並行して stop_watchdog を走らせることで、
-        stop_event がセットされたら client.disconnect() を呼んで
-        connect() を正常終了させる。
+        start() で Task を取得し、その Task を await しながら
+        stop_watchdog で stop_event を監視する。
 
-        ★ これが「監視停止ボタンを押してもアプリが固まる」問題の根本修正。
-          connect() 自体は stop_event を見ないので、
-          外部から disconnect() を呼ぶ必要がある。
+        stop_event がセットされたら:
+          1. ws を直接 disconnect して WS ループを終わらせる
+          2. task が自然に完了するのを待つ
+
+        ★ v9.4 の変更点:
+          connect() を廃止し start() + await task に置き換え。
+          connect() 内部も start() + await task を行うため、
+          watchdog から disconnect() を呼ぶと「同じ task を 2 箇所から await」
+          する二重 await 競合が発生し不安定になる問題を修正。
         """
         assert self.client is not None
 
         stop = self._stop_event
 
+        # start() は非ブロッキングで _event_loop_task(Task) を返す
+        task = await self.client.start()
+        print(f"[LiveBot] start() 完了 – WebSocket 接続中")
+
         async def stop_watchdog():
-            """stop_event を 0.3 秒ごとにポーリングし、セットされたら disconnect()"""
+            """stop_event を 0.3 秒ごとにポーリングし、セットされたら WS を切断"""
             while True:
-                await asyncio.sleep(0.3)  # v9.3: 0.5秒から0.3秒に短縮
+                await asyncio.sleep(0.3)
                 if stop and stop.is_set():
                     print("[LiveBot] 🛑 停止要求を検知 → WebSocket を切断します")
                     try:
-                        await self.client.disconnect()
+                        # ws を直接切断して _ws_client_loop を終わらせる
+                        await self.client._ws.disconnect()
                     except Exception as e:
-                        print(f"[LiveBot] disconnect エラー（無視）: {e}")
+                        print(f"[LiveBot] ws.disconnect エラー（無視）: {e}")
                     break
 
         watchdog_task = asyncio.create_task(stop_watchdog())
         try:
-            await self.client.connect()
+            # task (_ws_client_loop) が終わるまでブロック
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass  # 外部から cancel された場合は無視
+            except Exception as e:
+                raise  # 他の例外は上位に伝播
         finally:
-            # connect() が返ったら watchdog も不要なのでキャンセル
+            # task が終わったら watchdog も不要なのでキャンセル
             if not watchdog_task.done():
                 watchdog_task.cancel()
                 try:
@@ -454,15 +478,10 @@ class LiveBot:
                             await _sleep_cd(wait, "リトライ待機", self._stop_event)
 
             finally:
-                # ★ v9.3: 後片付け: クライアントを確実にクリーンアップ
+                # ★ v9.4: 後片付け: クライアントを確実にクリーンアップ（1回のみ）
                 if self.client is not None:
                     try:
-                        if self.client.connected:
-                            await self.client.disconnect()
-                    except Exception:
-                        pass
-                    try:
-                        # HTTPクライアントを適切に閉じる
+                        # close_client=True で HTTP クライアントも一緒に閉じる
                         await self.client.disconnect(close_client=True)
                     except Exception:
                         pass
