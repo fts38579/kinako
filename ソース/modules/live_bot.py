@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-カワウソマネージャー きなこ – LiveBot  v9.0
+カワウソマネージャー きなこ – LiveBot  v9.1
 変更:
   v8.8: _gift_last を __init__ に移動（競合リスク解消）
   v8.9: stop_event 連携追加（GUI停止ボタンでループ終了）
@@ -9,6 +9,11 @@
         connect() は接続が切れるまでブロックする正しい API
         gift.name の取得方法を修正（event.gift.name）
         ログ出力を詳細化してデバッグしやすくした
+  v9.1: [修正] _fire_end_callback を daemon=True に変更
+        （アプリ終了をブロックしない）
+        [修正] モジュールレベルの config 参照を遅延ロードに変更
+        （LiveBot.__init__ 内で importlib.reload(config) を実行）
+        [修正] _init_csv/_init_viewers_csv を None ガード付きに変更
 """
 
 import sys
@@ -18,6 +23,7 @@ import asyncio
 import threading
 import traceback
 import csv
+import importlib
 from typing import Optional, Callable
 
 from TikTokLive import TikTokLiveClient
@@ -40,7 +46,12 @@ else:
 def _data_path(rel: str) -> str:
     return os.path.join(_PROJECT_ROOT, rel)
 
-import config
+# ★ v9.1 修正: モジュールレベルでは一旦インポートするだけ
+# 実際の値参照は LiveBot.__init__ 内で reload() 後に行う
+try:
+    import config
+except ImportError:
+    config = None  # type: ignore
 
 # ── ユーティリティ ────────────────────────────────────────────────
 def _safe_str(v) -> str:
@@ -98,16 +109,33 @@ async def _sleep_cd(seconds: int, label: str,
         await asyncio.sleep(min(5, max(0.1, remaining)))
 
 # ── CSV（ギフトタイムライン） ────────────────────────────────────
-_CSV_FILE    = _data_path(getattr(config, "CSV_FILE", "data/gift_timeline.csv"))
+# ★ v9.1: パスは None で初期化し、_resolve_paths() で設定
+_CSV_FILE    = None
 _CSV_HEADERS = ["timestamp", "type", "user", "unique_id", "detail"]
 
+# ── viewers.csv（入室ログ） ───────────────────────────────────────
+_VIEWERS_FILE    = None
+_VIEWERS_HEADERS = ["session_date", "session_start", "unique_id", "display_name"]
+
+
+def _resolve_paths():
+    """config から CSV パスを取得する（遅延して呼び出し）"""
+    global _CSV_FILE, _VIEWERS_FILE
+    _CSV_FILE     = _data_path(getattr(config, "CSV_FILE",     "data/gift_timeline.csv"))
+    _VIEWERS_FILE = _data_path(getattr(config, "VIEWERS_FILE", "data/viewers.csv"))
+
+
 def _init_csv():
+    if not _CSV_FILE:
+        return
     os.makedirs(os.path.dirname(_CSV_FILE), exist_ok=True)
     if not os.path.exists(_CSV_FILE):
         with open(_CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
             csv.writer(f).writerow(_CSV_HEADERS)
 
 def _append_csv(row_type, user, uid, detail):
+    if not _CSV_FILE:
+        return
     try:
         with open(_CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
             csv.writer(f).writerow([
@@ -117,17 +145,18 @@ def _append_csv(row_type, user, uid, detail):
     except Exception as e:
         print(f"[CSV] 書き込みエラー: {e}")
 
-# ── viewers.csv（入室ログ） ───────────────────────────────────────
-_VIEWERS_FILE    = _data_path(getattr(config, "VIEWERS_FILE", "data/viewers.csv"))
-_VIEWERS_HEADERS = ["session_date", "session_start", "unique_id", "display_name"]
 
 def _init_viewers_csv():
+    if not _VIEWERS_FILE:
+        return
     os.makedirs(os.path.dirname(_VIEWERS_FILE), exist_ok=True)
     if not os.path.exists(_VIEWERS_FILE):
         with open(_VIEWERS_FILE, "w", newline="", encoding="utf-8-sig") as f:
             csv.writer(f).writerow(_VIEWERS_HEADERS)
 
 def _append_viewer(session_date: str, session_start: str, uid: str, name: str):
+    if not _VIEWERS_FILE:
+        return
     try:
         with open(_VIEWERS_FILE, "a", newline="", encoding="utf-8-sig") as f:
             csv.writer(f).writerow([session_date, session_start, uid, name])
@@ -136,7 +165,7 @@ def _append_viewer(session_date: str, session_start: str, uid: str, name: str):
 
 # ── リピート率計算 ───────────────────────────────────────────────
 def _calc_repeat_rate() -> tuple:
-    if not os.path.exists(_VIEWERS_FILE):
+    if not _VIEWERS_FILE or not os.path.exists(_VIEWERS_FILE):
         return 0, 0, 0.0
     try:
         uid_sessions: dict = {}
@@ -160,7 +189,24 @@ class LiveBot:
     def __init__(self,
                  on_stream_end_callback: Optional[Callable] = None,
                  stop_event: Optional[threading.Event] = None):
-        self.username          = config.MY_TIKTOK_USERNAME
+        # ★ v9.1 修正: __init__ 内で config を再ロードして最新値を保証
+        global config
+        if config is not None:
+            try:
+                importlib.reload(config)
+            except Exception:
+                pass
+        else:
+            try:
+                import config as _cfg
+                config = _cfg
+            except ImportError:
+                pass
+
+        # ★ v9.1: config 値初期化後にパス解決
+        _resolve_paths()
+
+        self.username          = getattr(config, 'MY_TIKTOK_USERNAME', '') if config else ''
         self._on_stream_end_cb = on_stream_end_callback
         self._stop_event       = stop_event  # GUI 停止ボタンと連携
         self.client            = None
@@ -185,11 +231,13 @@ class LiveBot:
         return self._should_stop
 
     def _fire_end_callback(self):
-        """on_stream_end_callback をスレッドで安全に一度だけ発火"""
+        """on_stream_end_callback をスレッドで安全に一度だけ発火
+        ★ v9.1 修正: daemon=True に変更（アプリ終了をブロックしない）
+        """
         if self._on_stream_end_cb:
             if self._end_cb_thread is None or not self._end_cb_thread.is_alive():
                 self._end_cb_thread = threading.Thread(
-                    target=self._on_stream_end_cb, daemon=False)
+                    target=self._on_stream_end_cb, daemon=True)  # daemon=True
                 self._end_cb_thread.start()
 
     # ── イベントハンドラ ──────────────────────────────────────────
