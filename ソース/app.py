@@ -68,11 +68,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette, QTextCursor
 import pyqtgraph as pg
 from pyqtgraph import BarGraphItem, PlotWidget, mkPen, mkBrush
 import numpy as np
-
-# PyQtGraph グローバル設定
-pg.setConfigOption("background", "#1e1b2e")   # C_BG
-pg.setConfigOption("foreground", "#e5e7eb")   # C_TEXT
-pg.setConfigOptions(antialias=True)
+import platform
 
 try:
     import pandas as pd
@@ -80,10 +76,18 @@ try:
 except ImportError:
     _HAS_PANDAS = False
 
-# ── 日本語フォント設定（PyQtGraph用） ────────────────────────────
-import platform
-def _jp_font_name() -> str:
-    """OSに応じて利用可能な日本語フォントを返す"""
+# ── PyQtGraph / フォント初期化（QApplication生成後に必ず呼ぶ） ──
+_JP_FONT = "MS Gothic"  # デフォルト。_init_pyqtgraph() で上書きされる
+
+def _init_pyqtgraph():
+    """QApplication 生成後に一度だけ呼ぶ。
+    pg.setConfigOption は QApplication より前に呼ぶとクラッシュする。"""
+    global _JP_FONT
+    # PyQtGraph グローバル設定
+    pg.setConfigOption("background", "#1e1b2e")
+    pg.setConfigOption("foreground", "#e5e7eb")
+    pg.setConfigOptions(antialias=True)
+    # 日本語フォント選択
     sys_fonts = {
         "Windows": ["Meiryo", "Yu Gothic", "MS Gothic"],
         "Darwin":  ["Hiragino Sans", "Hiragino Kaku Gothic ProN"],
@@ -94,10 +98,9 @@ def _jp_font_name() -> str:
     available = set(QFontDatabase.families())
     for name in candidates:
         if name in available:
-            return name
-    return "DejaVu Sans"
-
-_JP_FONT = _jp_font_name()
+            _JP_FONT = name
+            return
+    _JP_FONT = "DejaVu Sans"
 
 # ────────────────────────────────────────────────────────────────
 #  カラーパレット（ダークテーマ）
@@ -1037,6 +1040,8 @@ class KinakoApp(QMainWindow):
         e = pd.to_datetime(self._de_ins_end.date().toString("yyyy-MM-dd")) \
             + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
         df = df[(df["_date"] >= s) & (df["_date"] <= e)]
+        # ★ 空でも先に代入（エクスポートで「未表示」エラーを防ぐ）
+        self._insight_df = df
         if df.empty: return
 
         col_peak    = "最高同時視聴者数" if "最高同時視聴者数" in df.columns else find_col(df,"最高同時","peak")
@@ -1057,15 +1062,16 @@ class KinakoApp(QMainWindow):
             (self._pw_ins[3], col_watch,   "#e87c7c"),
         ]
         for pw, col, color in cfgs:
-            if col and col in df.columns:
-                vals = df[col].fillna(0).tolist()
-                _bar_graph(pw, vals, color, labels)
-            else:
-                pw.clear()
-                pw.addItem(pg.TextItem("データなし", color=C_SUBTEXT,
-                                       anchor=(0.5, 0.5)))
-
-        self._insight_df = df
+            try:
+                if col and col in df.columns:
+                    vals = df[col].fillna(0).tolist()
+                    _bar_graph(pw, vals, color, labels)
+                else:
+                    pw.clear()
+                    pw.addItem(pg.TextItem("データなし", color=C_SUBTEXT,
+                                           anchor=(0.5, 0.5)))
+            except Exception:
+                pass
 
     # ── ギフトレポート ──
     def _build_gift_report(self):
@@ -1092,44 +1098,57 @@ class KinakoApp(QMainWindow):
         e = (pd.to_datetime(self._de_gift_end.date().toString("yyyy-MM-dd"))
              + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)).date()
         df_r = df[(df["_date"].dt.date >= s) & (df["_date"].dt.date <= e)].copy()
+        # ★ 空でも先に代入（エクスポートで「未表示」エラーを防ぐ）
+        self._gift_df = df_r
         if df_r.empty: return
 
         # 時間帯別
-        self._pw_gift_hourly.clear()
-        if "_date" in df_r.columns:
-            df_r["hour"] = df_r["_date"].dt.hour
-            hourly = df_r.groupby("hour").size()
-            hours  = hourly.index.tolist()
-            vals   = hourly.values.tolist()
-            bar = pg.BarGraphItem(x=hours, height=vals, width=0.6,
-                                  brush=pg.mkBrush("#f5a623cc"),
-                                  pen=pg.mkPen("#f5a623"))
-            self._pw_gift_hourly.addItem(bar)
-            for xi, v in zip(hours, vals):
-                t = pg.TextItem(str(v), color="white", anchor=(0.5, 1.0))
-                t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
-                t.setPos(xi, v)
-                self._pw_gift_hourly.addItem(t)
-            self._pw_gift_hourly.getPlotItem().getAxis("bottom").setLabel("時刻（時）", color=C_SUBTEXT)
-            self._pw_gift_hourly.getPlotItem().getAxis("left").setLabel("ギフト回数", color=C_SUBTEXT)
+        try:
+            self._pw_gift_hourly.clear()
+            if "_date" in df_r.columns:
+                df_r["hour"] = df_r["_date"].dt.hour
+                hourly = df_r.groupby("hour").size()
+                hours  = hourly.index.tolist()
+                vals   = hourly.values.tolist()
+                bar = pg.BarGraphItem(x=hours, height=vals, width=0.6,
+                                      brush=pg.mkBrush("#f5a623cc"),
+                                      pen=pg.mkPen("#f5a623"))
+                self._pw_gift_hourly.addItem(bar)
+                for xi, v in zip(hours, vals):
+                    t = pg.TextItem(str(v), color="white", anchor=(0.5, 1.0))
+                    t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
+                    t.setPos(xi, v)
+                    self._pw_gift_hourly.addItem(t)
+                self._pw_gift_hourly.getPlotItem().getAxis("bottom").setLabel("時刻（時）", color=C_SUBTEXT)
+                self._pw_gift_hourly.getPlotItem().getAxis("left").setLabel("ギフト回数", color=C_SUBTEXT)
+        except Exception:
+            pass
 
         # トップギフター
-        self._pw_gift_top.clear()
-        if "user" in df_r.columns:
-            tg   = df_r.groupby("user").size().nlargest(10)
-            lbls = tg.index.tolist()[::-1]
-            vals = tg.values.tolist()[::-1]
-            _barh_graph(self._pw_gift_top, vals, lbls, "#7ed321")
+        try:
+            self._pw_gift_top.clear()
+            if "user" in df_r.columns:
+                tg   = df_r.groupby("user").size().nlargest(10)
+                lbls = tg.index.tolist()[::-1]
+                vals = tg.values.tolist()[::-1]
+                _barh_graph(self._pw_gift_top, vals, lbls, "#7ed321")
+        except Exception:
+            pass
 
         # ギフト種別
-        self._pw_gift_type.clear()
-        if "gift_name" in df_r.columns:
-            tgt  = df_r.groupby("gift_name")["count"].sum().nlargest(10)
-            lbls = tgt.index.tolist()[::-1]
-            vals = tgt.values.tolist()[::-1]
-            _barh_graph(self._pw_gift_type, vals, lbls, "#4f86c6")
-
-        self._gift_df = df_r
+        try:
+            self._pw_gift_type.clear()
+            if "gift_name" in df_r.columns:
+                col_count = "count" if "count" in df_r.columns else None
+                if col_count:
+                    tgt = df_r.groupby("gift_name")[col_count].sum().nlargest(10)
+                else:
+                    tgt = df_r.groupby("gift_name").size().nlargest(10)
+                lbls = tgt.index.tolist()[::-1]
+                vals = [int(v) for v in tgt.values.tolist()[::-1]]
+                _barh_graph(self._pw_gift_type, vals, lbls, "#4f86c6")
+        except Exception:
+            pass
 
     # ── リピート率レポート ──
     def _build_repeat_report(self):
@@ -1154,6 +1173,8 @@ class KinakoApp(QMainWindow):
         e = (pd.to_datetime(self._de_rep_end.date().toString("yyyy-MM-dd"))
              + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)).date()
         df = df[(df["session_date"] >= s) & (df["session_date"] <= e)]
+        # ★ 空でも先に代入（エクスポートで「未表示」エラーを防ぐ）
+        self._repeat_df = df
         if df.empty: return
 
         uid_col  = "uid" if "uid" in df.columns else \
@@ -1211,8 +1232,6 @@ class KinakoApp(QMainWindow):
             self._pw_rep_top.getPlotItem().getAxis("bottom").setLabel(
                 "参加セッション数", color=C_SUBTEXT)
 
-        self._repeat_df = df
-
     # ─────────────────────────────────────────────────────────
     #  エクスポート
     # ─────────────────────────────────────────────────────────
@@ -1230,6 +1249,7 @@ class KinakoApp(QMainWindow):
         if df is None:
             QMessageBox.warning(self, "未表示",
                 "先にレポートタブでグラフを表示してください。"); return
+        # df が空（期間内データなし）でも空ファイルとして保存する
         try:
             import openpyxl
         except ImportError:
@@ -1257,6 +1277,7 @@ class KinakoApp(QMainWindow):
         if df is None:
             QMessageBox.warning(self, "未表示",
                 "先にレポートタブでグラフを表示してください。"); return
+        # df が空（期間内データなし）でも空ファイルとして保存する
         path, _ = QFileDialog.getSaveFileName(
             self, "CSVを保存", f"{title}.csv", "CSV (*.csv)")
         if not path: return
@@ -1309,6 +1330,7 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    _init_pyqtgraph()   # ★ QApplication 生成後に PyQtGraph を初期化
     window = KinakoApp()
     window.show()
     sys.exit(app.exec())
