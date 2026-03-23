@@ -277,7 +277,7 @@ CHROME_PATHS = [
     os.path.join(os.environ.get("LOCALAPPDATA", ""),
                  r"Google\Chrome\Application\chrome.exe"),
 ]
-ALLOWED_URL_PREFIX = "https://livecenter.tiktok.com/"
+FIXED_ANALYTICS_URL   = "https://livecenter.tiktok.com/analytics/live_video?lang=ja-JP"
 
 def find_chrome():
     for p in CHROME_PATHS:
@@ -292,12 +292,6 @@ def validate_tiktok_id(v):
         return "TikTok ID に使えない文字が含まれています。\n（英数字・アンダースコア・ピリオドのみ）"
     return None
 
-def validate_url(v):
-    if not v: return "インサイトページ URL を入力してください。"
-    if not v.startswith(ALLOWED_URL_PREFIX):
-        return f"URL は {ALLOWED_URL_PREFIX} で始まる必要があります。"
-    return None
-
 def read_config_value(key):
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -308,7 +302,7 @@ def read_config_value(key):
         pass
     return ""
 
-def update_config(tiktok_id, url):
+def update_config(tiktok_id):
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         content = f.read()
     def replace_var(text, key, val):
@@ -318,7 +312,7 @@ def update_config(tiktok_id, url):
         if n == 0: new += f"\n{key} = {repr(val)}\n"
         return new
     content = replace_var(content, "MY_TIKTOK_USERNAME", tiktok_id)
-    content = replace_var(content, "ANALYTICS_URL", url)
+    content = replace_var(content, "ANALYTICS_URL", FIXED_ANALYTICS_URL)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -683,15 +677,15 @@ class KinakoApp(QMainWindow):
         self._tabs = QTabWidget()
         root_layout.addWidget(self._tabs)
 
-        self._tab_setup   = QWidget()
         self._tab_live    = QWidget()
         self._tab_insight = QWidget()
         self._tab_report  = QWidget()
+        self._tab_setup   = QWidget()
 
-        self._tabs.addTab(self._tab_setup,   "⚙️  セットアップ")
         self._tabs.addTab(self._tab_live,    "📡  ライブ監視")
         self._tabs.addTab(self._tab_insight, "📥  インサイト取得")
         self._tabs.addTab(self._tab_report,  "📊  レポート")
+        self._tabs.addTab(self._tab_setup,   "⚙️  設定")
 
         self._build_setup_tab()
         self._build_live_tab()
@@ -713,9 +707,9 @@ class KinakoApp(QMainWindow):
         lay.setContentsMargins(40, 24, 40, 24)
         lay.setSpacing(10)
 
-        t = QLabel("⚙️  初期セットアップ"); t.setObjectName("sectionTitle"); lay.addWidget(t)
+        t = QLabel("⚙️  設定"); t.setObjectName("sectionTitle"); lay.addWidget(t)
 
-        sub = QLabel("2項目を入力して「保存してセットアップ完了」を押してください")
+        sub = QLabel("TikTok ID を入力して「保存して設定完了」を押してください")
         sub.setObjectName("subText"); lay.addWidget(sub)
 
         cfg_lbl = QLabel(f"📄 config.py: {CONFIG_FILE}")
@@ -728,15 +722,8 @@ class KinakoApp(QMainWindow):
         self._setup_id.setPlaceholderText("例: kinako_tiktok")
         lay.addWidget(self._setup_id)
 
-        lay.addSpacing(6)
-        lay.addWidget(QLabel("② インサイトページ URL"))
-        self._setup_url = QLineEdit(read_config_value("ANALYTICS_URL"))
-        self._setup_url.setPlaceholderText(
-            "https://livecenter.tiktok.com/analytics/live_video?lang=ja-JP")
-        lay.addWidget(self._setup_url)
-
         lay.addSpacing(16)
-        save_btn = btn("✅  保存してセットアップ完了", C_ACCENT, self._on_setup_save)
+        save_btn = btn("✅  保存して設定完了", C_ACCENT, self._on_setup_save)
         save_btn.setFixedHeight(44)
         lay.addWidget(save_btn)
 
@@ -748,8 +735,9 @@ class KinakoApp(QMainWindow):
 
     def _on_setup_save(self):
         tid = self._setup_id.text().strip().lstrip("@")
-        url = self._setup_url.text().strip()
-        for err in (validate_tiktok_id(tid), validate_url(url)):
+        # インサイトページURLはアプリ内で固定（ユーザー入力不要）
+        url = FIXED_ANALYTICS_URL
+        for err in (validate_tiktok_id(tid),):
             if err:
                 QMessageBox.warning(self, "入力エラー", err); return
         # ★ Bug-C 修正: Chrome が見つからなくても設定保存は続行（警告のみ）
@@ -761,13 +749,13 @@ class KinakoApp(QMainWindow):
                               "インストール済みの場合は問題ありません。\n"
                               "Chrome がない場合は https://www.google.com/chrome/ からインストールしてください。")
         try:
-            update_config(tid, url)
+            update_config(tid)
             # ★ Bug-A 修正③: config.py 書き換え後にキャッシュを破棄
             # 次に import config または importlib.reload(config) した時に
             # 必ず最新の config.py が読まれるようにする
             import sys as _sys
             _sys.modules.pop("config", None)
-            QMessageBox.information(self, "セットアップ完了 🎉",
+            QMessageBox.information(self, "設定完了 🎉",
                 f"設定を保存しました！\n\n  ・TikTok ID : @{tid}\n\n"
                 "「📡 ライブ監視」タブから配信監視を開始できます！" + chrome_warning)
         except PermissionError:
@@ -834,11 +822,9 @@ class KinakoApp(QMainWindow):
             importlib.reload(config)
             if not config.MY_TIKTOK_USERNAME:
                 raise ValueError("MY_TIKTOK_USERNAME が未設定です")
-            if not config.ANALYTICS_URL.startswith("https://livecenter.tiktok.com/"):
-                raise ValueError("ANALYTICS_URL が不正です")
         except ValueError as e:
-            QMessageBox.critical(self, "セットアップ未完了",
-                f"設定に問題があります。\n\n{e}\n\n「⚙️ セットアップ」タブで設定してください。")
+            QMessageBox.critical(self, "設定未完了",
+                f"設定に問題があります。\n\n{e}\n\n「⚙️ 設定」タブで設定してください。")
             return
         except Exception as e:
             QMessageBox.critical(self, "設定読み込みエラー",
@@ -897,7 +883,7 @@ class KinakoApp(QMainWindow):
         lay.addSpacing(20)
         guide = QLabel(
             "【手動取得の使い方】\n"
-            "1. 「⚙️ セットアップ」タブで設定を済ませてください\n"
+            "1. 「⚙️ 設定」タブで設定を済ませてください\n"
             "2. 「今すぐインサイトを取得」ボタンを押します\n"
             "3. Chrome が自動起動します（初回は TikTok ログインが必要）\n"
             "4. 取得完了後、「📊 レポート」タブでグラフを確認できます\n\n"
