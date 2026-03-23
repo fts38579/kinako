@@ -325,6 +325,33 @@ def find_col(df, *kws):
             if kw in col: return col
     return None
 
+def _parse_watch_time_to_minutes(val):
+    """「4分」「2時間11分」「6秒」「1分48秒」などを分単位の float に変換する。
+    変換できない場合は 0.0 を返す。"""
+    if pd.isna(val): return 0.0
+    s = str(val).strip()
+    if not s or s in ("N/A", "-", ""): return 0.0
+    # まず純粋な数値なら分としてそのまま返す
+    try: return float(s)
+    except ValueError: pass
+    total = 0.0
+    m = re.search(r"(\d+)\s*時間", s)
+    if m: total += int(m.group(1)) * 60
+    m = re.search(r"(\d+)\s*分", s)
+    if m: total += int(m.group(1))
+    m = re.search(r"(\d+)\s*秒", s)
+    if m: total += int(m.group(1)) / 60
+    return total
+
+def _parse_recommend_pct(val):
+    """「60%」→ 60.0、「N/A」→ 0.0、「-」→ 0.0 に変換する。"""
+    if pd.isna(val): return 0.0
+    s = str(val).strip()
+    if not s or s in ("N/A", "-", ""): return 0.0
+    s = s.replace("%", "").strip()
+    try: return float(s)
+    except ValueError: return 0.0
+
 def _insights_csv_path():
     try:
         import config as _cfg
@@ -1005,15 +1032,16 @@ class KinakoApp(QMainWindow):
         lay.setContentsMargins(8, 8, 8, 8)
         self._de_ins_start, self._de_ins_end = self._make_ctrl_row(lay, self._on_show_insights)
 
-        # 2×2 グリッドに PlotWidget を配置
+        # 2×3 グリッドに PlotWidget を配置（2列×3行）
         grid = QWidget()
         gl = QGridLayout(grid)
         gl.setSpacing(6)
         self._pw_ins = [
-            _make_plot_widget("最高同時視聴者数（人）"),
-            _make_plot_widget("ダイヤ数"),
-            _make_plot_widget("ギフト贈呈者数（人）"),
-            _make_plot_widget("平均視聴時間"),
+            _make_plot_widget("最高同時視聴者数（人）"),  # [0] row0 col0
+            _make_plot_widget("ダイヤ数"),               # [1] row0 col1
+            _make_plot_widget("ギフト贈呈者数（人）"),   # [2] row1 col0
+            _make_plot_widget("平均視聴時間（分）"),     # [3] row1 col1
+            _make_plot_widget("LIVEおすすめ率（%）"),    # [4] row2 col0
         ]
         for i, pw in enumerate(self._pw_ins):
             gl.addWidget(pw, i // 2, i % 2)
@@ -1034,9 +1062,19 @@ class KinakoApp(QMainWindow):
         col_diamond = "ダイヤ合計"      if "ダイヤ合計"      in df.columns else find_col(df,"diamond")
         col_gifter  = "ギフト贈呈者数"  if "ギフト贈呈者数"  in df.columns else find_col(df,"ギフト贈呈","gifter")
         col_watch   = "平均視聴時間"    if "平均視聴時間"    in df.columns else find_col(df,"平均視聴","watch")
+        col_rec     = "LIVEおすすめ"    if "LIVEおすすめ"    in df.columns else find_col(df,"おすすめ","recommend")
 
-        for col in [col_peak, col_diamond, col_gifter, col_watch]:
+        # 数値変換：peak / diamond / gifter は pd.to_numeric で十分
+        for col in [col_peak, col_diamond, col_gifter]:
             if col: df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # 平均視聴時間：「4分」「2時間11分」「6秒」→ 分単位 float に変換
+        if col_watch:
+            df[col_watch] = df[col_watch].apply(_parse_watch_time_to_minutes)
+
+        # LIVEおすすめ：「60%」→ 60.0、「N/A」→ 0.0
+        if col_rec:
+            df[col_rec] = df[col_rec].apply(_parse_recommend_pct)
 
         labels = (df["_date"].dt.strftime("%m/%d").tolist()
                   if "_date" in df.columns else [str(i) for i in range(len(df))])
@@ -1046,6 +1084,7 @@ class KinakoApp(QMainWindow):
             (self._pw_ins[1], col_diamond, "#f5a623"),
             (self._pw_ins[2], col_gifter,  "#7ed321"),
             (self._pw_ins[3], col_watch,   "#e87c7c"),
+            (self._pw_ins[4], col_rec,     "#c084fc"),
         ]
         for pw, col, color in cfgs:
             try:
