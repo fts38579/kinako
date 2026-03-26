@@ -55,6 +55,7 @@ DETAIL_KEYS = {
     "ギフト贈呈者数":   ["ギフト贈呈", "gift giver", "ギフター"],
     "LIVEおすすめ":    ["おすすめ", "recommend", "レコメンド"],
     "ダイヤ合計":      ["ダイヤ", "diamond", "diamonds"],
+    "ユニーク視聴者数": ["ユニーク視聴者", "unique viewer", "Unique Viewers"],
 }
 
 
@@ -230,7 +231,7 @@ def _write_csv(row_data: dict) -> None:
         "取得日時", "LIVE名", "日付", "LIVE時間",
         "視聴数", "新規フォロワー", "報酬(ダイヤ)",
         "最高同時視聴者数", "平均視聴時間", "ギフト贈呈者数",
-        "LIVEおすすめ", "ダイヤ合計",
+        "LIVEおすすめ", "ダイヤ合計", "ユニーク視聴者数",
     ]
 
     file_exists = os.path.exists(path)
@@ -251,6 +252,7 @@ def _write_csv(row_data: dict) -> None:
             row_data.get("ギフト贈呈者数",   "N/A"),
             row_data.get("LIVEおすすめ",     "N/A"),
             row_data.get("ダイヤ合計",       "N/A"),
+            row_data.get("ユニーク視聴者数", "N/A"),
         ])
     print(f"[Insights] CSV 保存完了: {path}")
 

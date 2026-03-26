@@ -57,12 +57,12 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit,
     QFileDialog, QMessageBox, QFrame, QDateEdit,
-    QSizePolicy, QScrollArea, QSplitter
+    QSizePolicy, QScrollArea, QSplitter, QProgressBar
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QObject, QDate, QTimer, pyqtSlot
+    Qt, QThread, pyqtSignal, QObject, QDate, QTimer, pyqtSlot, QRectF
 )
-from PyQt6.QtGui import QFont, QColor, QPalette, QTextCursor
+from PyQt6.QtGui import QFont, QColor, QPalette, QTextCursor, QPainter
 
 # ── PyQtGraph ────────────────────────────────────────────────────
 import pyqtgraph as pg
@@ -499,13 +499,152 @@ def _barh_graph(pw: pg.PlotWidget, values: list, labels: list, color: str):
     pw.getPlotItem().getAxis("left").setTicks([ticks])
     pw.getPlotItem().getAxis("bottom").setLabel("回数", color=C_SUBTEXT)
 
+
+def _line_graph(pw: pg.PlotWidget, values: list, color: str,
+                labels: list | None = None):
+    """折れ線グラフを描画（データポイント＋マーカー付き）"""
+    pw.clear()
+    n = len(values)
+    if n == 0:
+        return
+    x = list(range(n))
+    # 折れ線
+    pw.plot(x, values,
+            pen=pg.mkPen(color, width=2),
+            symbol="o", symbolSize=8,
+            symbolBrush=pg.mkBrush(color),
+            symbolPen=pg.mkPen("white", width=1))
+    # 値ラベル
+    for xi, v in zip(x, values):
+        txt = pg.TextItem(text=f"{v:.1f}" if isinstance(v, float) and v != int(v)
+                          else str(int(v)),
+                          color="white", anchor=(0.5, 1.2))
+        txt.setFont(pg.QtGui.QFont(_JP_FONT, 7))
+        txt.setPos(xi, v)
+        pw.addItem(txt)
+    # 平均線
+    if n > 0:
+        mean_v = float(np.mean(values))
+        inf_line = pg.InfiniteLine(
+            pos=mean_v, angle=0,
+            pen=pg.mkPen("red", width=1.5, style=pg.QtCore.Qt.PenStyle.DashLine),
+            label=f"平均: {mean_v:.1f}",
+            labelOpts={"color": "red", "position": 0.95,
+                       "font": pg.QtGui.QFont(_JP_FONT, 8)}
+        )
+        pw.addItem(inf_line)
+    if labels:
+        _set_x_labels(pw, labels)
+
+
+# ────────────────────────────────────────────────────────────────
+#  円グラフウィジェット（PyQtGraph は円グラフ非対応のため QPainter で描画）
+# ────────────────────────────────────────────────────────────────
+class PieChartWidget(QWidget):
+    """リピーター比率用シンプル円グラフ"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._slices: list[tuple[float, str, str]] = []  # (value, label, color)
+        self._title: str = ""
+        self.setMinimumSize(200, 200)
+
+    def set_data(self, slices: list[tuple[float, str, str]], title: str = ""):
+        """slices: [(value, label, color), ...]. value は実数（比率計算は内部で行う）"""
+        self._slices = slices
+        self._title  = title
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = self.width(), self.height()
+        bg_color = QColor(C_BG)
+        painter.fillRect(0, 0, w, h, bg_color)
+
+        if not self._slices:
+            painter.setPen(QColor(C_SUBTEXT))
+            painter.drawText(QRectF(0, 0, w, h),
+                             Qt.AlignmentFlag.AlignCenter, "データなし")
+            painter.end()
+            return
+
+        total = sum(v for v, _, _ in self._slices)
+        if total <= 0:
+            painter.setPen(QColor(C_SUBTEXT))
+            painter.drawText(QRectF(0, 0, w, h),
+                             Qt.AlignmentFlag.AlignCenter, "データなし")
+            painter.end()
+            return
+
+        # タイトル描画
+        title_h = 24 if self._title else 0
+        if self._title:
+            painter.setPen(QColor("#c4b5fd"))
+            fnt = QFont(_JP_FONT, 9)
+            fnt.setBold(True)
+            painter.setFont(fnt)
+            painter.drawText(QRectF(0, 2, w, title_h),
+                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                             self._title)
+
+        # 凡例エリアの高さ
+        legend_h = 20 * len(self._slices) + 8
+        pie_size = min(w, h - title_h - legend_h) - 20
+        if pie_size < 40:
+            pie_size = 40
+        pie_x = (w - pie_size) // 2
+        pie_y = title_h + 8
+        pie_rect = QRectF(pie_x, pie_y, pie_size, pie_size)
+
+        # 円グラフ描画
+        start_angle = 90 * 16  # 12時方向から開始（Qt の単位は 1/16 度）
+        for val, lbl, color in self._slices:
+            span = int(round(val / total * 360 * 16))
+            painter.setPen(QColor(C_BG))
+            painter.setBrush(QColor(color))
+            painter.drawPie(pie_rect, start_angle, -span)
+            # パーセント表示（スライス中心に）
+            mid_angle_deg = (start_angle / 16) - (span / 16) / 2
+            import math
+            mid_rad = math.radians(mid_angle_deg)
+            r = pie_size / 2 * 0.62
+            cx = pie_x + pie_size / 2 + r * math.cos(mid_rad)
+            cy = pie_y + pie_size / 2 - r * math.sin(mid_rad)
+            pct = val / total * 100
+            if pct >= 5:
+                painter.setPen(QColor("white"))
+                painter.setFont(QFont(_JP_FONT, 8))
+                painter.drawText(QRectF(cx - 22, cy - 10, 44, 20),
+                                 Qt.AlignmentFlag.AlignCenter,
+                                 f"{pct:.1f}%")
+            start_angle -= span
+
+        # 凡例
+        legend_y = pie_y + pie_size + 10
+        painter.setFont(QFont(_JP_FONT, 8))
+        for i, (val, lbl, color) in enumerate(self._slices):
+            ly = legend_y + i * 20
+            painter.setBrush(QColor(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRect(int(pie_x), int(ly + 2), 12, 12)
+            painter.setPen(QColor(C_TEXT))
+            cnt_str = f"{int(val)}人  {val/total*100:.1f}%"
+            painter.drawText(int(pie_x + 18), int(ly + 13), f"{lbl}: {cnt_str}")
+
+        painter.end()
+
+
 # ────────────────────────────────────────────────────────────────
 #  ライブ監視ワーカースレッド  [Bug1 / Bug2 修正]
 # ────────────────────────────────────────────────────────────────
 class LiveWorker(QThread):
-    log_signal      = pyqtSignal(str)
-    status_signal   = pyqtSignal(str, str)   # (text, color)
-    finished_signal = pyqtSignal()
+    log_signal        = pyqtSignal(str)
+    status_signal     = pyqtSignal(str, str)   # (text, color)
+    finished_signal   = pyqtSignal()
+    insight_started   = pyqtSignal()           # インサイト取得開始
+    insight_finished  = pyqtSignal()           # インサイト取得完了
 
     def __init__(self, stop_event: threading.Event):
         super().__init__()
@@ -555,7 +694,9 @@ class LiveWorker(QThread):
                         return
                     time.sleep(5)
                     waited += 5
+                self.insight_started.emit()
                 self._run_insights()
+                self.insight_finished.emit()
 
             bot = LiveBot(on_stream_end_callback=on_stream_end,
                           stop_event=self._stop)
@@ -705,18 +846,15 @@ class KinakoApp(QMainWindow):
         root_layout.addWidget(self._tabs)
 
         self._tab_live    = QWidget()
-        self._tab_insight = QWidget()
         self._tab_report  = QWidget()
         self._tab_setup   = QWidget()
 
         self._tabs.addTab(self._tab_live,    "📡  ライブ監視")
-        self._tabs.addTab(self._tab_insight, "📥  インサイト取得")
         self._tabs.addTab(self._tab_report,  "📊  レポート")
         self._tabs.addTab(self._tab_setup,   "⚙️  設定")
 
         self._build_setup_tab()
         self._build_live_tab()
-        self._build_insight_tab()
         self._build_report_tab()
 
         # フッター
@@ -739,12 +877,9 @@ class KinakoApp(QMainWindow):
         sub = QLabel("TikTok ID を入力して「保存して設定完了」を押してください")
         sub.setObjectName("subText"); lay.addWidget(sub)
 
-        cfg_lbl = QLabel(f"📄 config.py: {CONFIG_FILE}")
-        cfg_lbl.setStyleSheet(f"color:{C_SUBTEXT}; font-size:8pt;"); lay.addWidget(cfg_lbl)
-
         lay.addSpacing(10)
 
-        lay.addWidget(QLabel("① TikTok ID（@ なし）"))
+        lay.addWidget(QLabel("TikTok ID（@ なし）"))
         self._setup_id = QLineEdit(read_config_value("MY_TIKTOK_USERNAME"))
         self._setup_id.setPlaceholderText("例: kinako_tiktok")
         lay.addWidget(self._setup_id)
@@ -754,7 +889,7 @@ class KinakoApp(QMainWindow):
         save_btn.setFixedHeight(44)
         lay.addWidget(save_btn)
 
-        foot = QLabel("設定は config.py に保存　／　Chrome は自動検出・永続プロファイルで起動")
+        foot = QLabel("Chrome は自動検出・永続プロファイルで起動します")
         foot.setStyleSheet(f"color:{C_SUBTEXT}; font-size:8pt;")
         foot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(foot)
@@ -796,13 +931,24 @@ class KinakoApp(QMainWindow):
     # ─────────────────────────────────────────────────────────
     def _build_live_tab(self):
         lay = QVBoxLayout(self._tab_live)
-        lay.setContentsMargins(40, 24, 40, 24)
+        lay.setContentsMargins(24, 16, 24, 16)
         lay.setSpacing(10)
 
         t = QLabel("📡  ライブ監視ボット"); t.setObjectName("sectionTitle"); lay.addWidget(t)
-        sub = QLabel("「監視開始」を押すとバックグラウンドで TikTok ライブを監視します。\n"
-                     "配信終了を検知すると、3分後にインサイトを自動取得します。")
-        sub.setObjectName("subText"); lay.addWidget(sub)
+
+        # 使い方の説明
+        guide = QLabel(
+            "【使い方】\n"
+            "1. 「⚙️ 設定」タブで TikTok ID を登録してください\n"
+            "2. 「▶ 監視開始」を押すとバックグラウンドで配信開始を待機します\n"
+            "3. 配信を検知すると自動でギフト・視聴者の記録を開始します\n"
+            "4. 配信終了後、3分待ってから自動でインサイトを取得します\n"
+            "5. 取得完了後は「📊 レポート」タブでグラフを確認できます\n"
+            "※ 緊急停止を押すと即座に監視を中断します（インサイト取得はスキップされます）"
+        )
+        guide.setObjectName("subText")
+        guide.setWordWrap(True)
+        lay.addWidget(guide)
 
         # ステータス行
         status_frame = QFrame(); status_frame.setObjectName("statusFrame")
@@ -817,12 +963,28 @@ class KinakoApp(QMainWindow):
         # ボタン行
         btn_row = QHBoxLayout()
         self._btn_start = btn("▶  監視開始", C_GREEN, self._on_live_start)
-        self._btn_stop  = btn("⏹  監視停止", C_RED,   self._on_live_stop)
+        self._btn_stop  = btn("🚨  緊急停止", C_RED,   self._on_live_stop)
         self._btn_stop.setEnabled(False)
         btn_row.addWidget(self._btn_start)
         btn_row.addWidget(self._btn_stop)
         btn_row.addStretch()
         lay.addLayout(btn_row)
+
+        # インサイト取得中インジケーター（非表示で待機）
+        self._insight_indicator = QFrame()
+        ind_lay = QHBoxLayout(self._insight_indicator)
+        ind_lay.setContentsMargins(8, 6, 8, 6)
+        self._insight_spinner = QProgressBar()
+        self._insight_spinner.setRange(0, 0)   # 不確定モード（グルグル）
+        self._insight_spinner.setFixedHeight(18)
+        self._insight_spinner.setFixedWidth(120)
+        ind_lay.addWidget(self._insight_spinner)
+        ind_lbl = QLabel("インサイト情報取得中…")
+        ind_lbl.setStyleSheet(f"color:#f5a623; font-weight:bold;")
+        ind_lay.addWidget(ind_lbl)
+        ind_lay.addStretch()
+        self._insight_indicator.setVisible(False)
+        lay.addWidget(self._insight_indicator)
 
         lay.addWidget(QLabel("ログ"))
         self._log_view = QTextEdit()
@@ -863,6 +1025,8 @@ class KinakoApp(QMainWindow):
         self._live_worker.log_signal.connect(self._append_log)
         self._live_worker.status_signal.connect(self._set_status)
         self._live_worker.finished_signal.connect(self._on_bot_finished)
+        self._live_worker.insight_started.connect(self._on_insight_started)
+        self._live_worker.insight_finished.connect(self._on_insight_finished)
         self._live_worker.start()
 
         self._btn_start.setEnabled(False)
@@ -875,30 +1039,55 @@ class KinakoApp(QMainWindow):
             f"color:{color}; font-weight:bold; font-size:11pt;")
 
     def _on_live_stop(self):
-        """停止ボタン：stop_event をセットして監視を終了"""
+        """緊急停止ボタン：警告ポップアップを出してから stop_event をセット"""
+        result = QMessageBox.warning(
+            self, "⚠️ 緊急停止",
+            "監視を緊急停止します。\n\n"
+            "・現在の配信データの記録は中断されます\n"
+            "・インサイトの自動取得は行われません\n\n"
+            "本当に停止しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
         self._bot_stop_event.set()
         self._btn_stop.setEnabled(False)
         self._set_status("⏸ 停止中…", "#f59e0b")
-        self._append_log("停止リクエストを送信しました")
+        self._append_log("🚨 緊急停止リクエストを送信しました（インサイト取得はスキップ）")
+
+    @pyqtSlot()
+    def _on_insight_started(self):
+        """インサイト取得開始 → インジケーターを表示"""
+        self._insight_indicator.setVisible(True)
+        self._set_status("🔄 インサイト取得中…", "#f5a623")
+
+    @pyqtSlot()
+    def _on_insight_finished(self):
+        """インサイト取得完了 → インジケーターを非表示"""
+        self._insight_indicator.setVisible(False)
+        self._set_status("✅ インサイト取得完了", C_GREEN)
 
     @pyqtSlot()
     def _on_bot_finished(self):
         self._btn_start.setEnabled(True)
         self._btn_stop.setEnabled(False)
+        self._insight_indicator.setVisible(False)
         self._set_status("⏹ 停止中", C_RED)
         self._append_log("監視ボットが停止しました")
 
     # ─────────────────────────────────────────────────────────
     #  ③ インサイト手動取得タブ
     # ─────────────────────────────────────────────────────────
-    def _build_insight_tab(self):
-        lay = QVBoxLayout(self._tab_insight)
+    def _build_insight_fetch_tab(self, parent_widget):
+        """レポートタブ内の「📥 インサイト取得」サブタブのコンテンツを構築"""
+        lay = QVBoxLayout(parent_widget)
         lay.setContentsMargins(40, 24, 40, 24)
         lay.setSpacing(10)
 
         t = QLabel("📥  インサイト手動取得"); t.setObjectName("sectionTitle"); lay.addWidget(t)
         sub = QLabel("ボタンを押すと Chrome が自動起動し、TikTok LiveCenter から\n"
-                     "最新の配信インサイトデータを取得して data/insights.csv に保存します。")
+                     "最新の配信インサイトデータを取得して保存します。")
         sub.setObjectName("subText"); lay.addWidget(sub)
 
         lay.addSpacing(16)
@@ -910,10 +1099,10 @@ class KinakoApp(QMainWindow):
         lay.addSpacing(20)
         guide = QLabel(
             "【手動取得の使い方】\n"
-            "1. 「⚙️ 設定」タブで設定を済ませてください\n"
+            "1. 「⚙️ 設定」タブで TikTok ID を登録してください\n"
             "2. 「今すぐインサイトを取得」ボタンを押します\n"
             "3. Chrome が自動起動します（初回は TikTok ログインが必要）\n"
-            "4. 取得完了後、「📊 レポート」タブでグラフを確認できます\n\n"
+            "4. 取得完了後、「📊 インサイト」タブでグラフを確認できます\n\n"
             "※ ChromeDriver は自動インストールされます（webdriver-manager）"
         )
         guide.setObjectName("subText")
@@ -922,10 +1111,12 @@ class KinakoApp(QMainWindow):
 
     def _on_insight_get(self):
         try:
-            import config; config.validate()
+            import importlib, config
+            importlib.reload(config)
+            if not config.MY_TIKTOK_USERNAME:
+                raise ValueError("TikTok ID が設定されていません。「⚙️ 設定」タブで設定してください。")
         except Exception as e:
-            QMessageBox.critical(self, "設定エラー",
-                f"config.py の設定に問題があります。\n\n{e}")
+            QMessageBox.critical(self, "設定エラー", str(e))
             return
         if QMessageBox.question(self, "インサイト手動取得",
             "TikTok LiveCenter のインサイトを今すぐ取得します。\n\n"
@@ -978,22 +1169,29 @@ class KinakoApp(QMainWindow):
         """)
         lay.addWidget(sub_tabs)
 
-        self._rtab_insight = QWidget()
-        self._rtab_gift    = QWidget()
-        self._rtab_repeat  = QWidget()
-        sub_tabs.addTab(self._rtab_insight, "📊  インサイト")
-        sub_tabs.addTab(self._rtab_gift,    "🎁  ギフト")
-        sub_tabs.addTab(self._rtab_repeat,  "👥  リピート率")
+        self._rtab_insight      = QWidget()
+        self._rtab_gift         = QWidget()
+        self._rtab_repeat       = QWidget()
+        self._rtab_ranking      = QWidget()
+        self._rtab_fetch        = QWidget()
+        sub_tabs.addTab(self._rtab_insight,      "📊  インサイト")
+        sub_tabs.addTab(self._rtab_gift,         "🎁  ギフト")
+        sub_tabs.addTab(self._rtab_repeat,       "👥  リピート率")
+        sub_tabs.addTab(self._rtab_ranking,      "🏆  ユーザーランキング")
+        sub_tabs.addTab(self._rtab_fetch,        "📥  インサイト取得")
         self._report_sub_tabs = sub_tabs
 
         self._build_insight_report()
         self._build_gift_report()
         self._build_repeat_report()
+        self._build_ranking_tab()
+        self._build_insight_fetch_tab(self._rtab_fetch)
 
         # 初期描画（遅延）
         QTimer.singleShot(400, self._on_show_insights)
         QTimer.singleShot(500, self._on_show_gift)
         QTimer.singleShot(600, self._on_show_repeat)
+        QTimer.singleShot(700, self._on_show_ranking)
 
     def _make_ctrl_row(self, parent_lay, on_show):
         """日付範囲コントロール行を生成し、(date_start, date_end) を返す"""
@@ -1030,22 +1228,51 @@ class KinakoApp(QMainWindow):
     def _build_insight_report(self):
         lay = QVBoxLayout(self._rtab_insight)
         lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(4)
         self._de_ins_start, self._de_ins_end = self._make_ctrl_row(lay, self._on_show_insights)
 
-        # 2×3 グリッドに PlotWidget を配置（2列×3行）
-        grid = QWidget()
-        gl = QGridLayout(grid)
-        gl.setSpacing(6)
-        self._pw_ins = [
-            _make_plot_widget("最高同時視聴者数（人）"),  # [0] row0 col0
-            _make_plot_widget("ダイヤ数"),               # [1] row0 col1
-            _make_plot_widget("ギフト贈呈者数（人）"),   # [2] row1 col0
-            _make_plot_widget("平均視聴時間（分）"),     # [3] row1 col1
-            _make_plot_widget("LIVEおすすめ率（%）"),    # [4] row2 col0
+        # インサイトをサブタブで「トレンド（折れ線）」「集計（棒グラフ）」に分割
+        ins_sub = QTabWidget()
+        ins_sub.setStyleSheet(f"""
+            QTabBar::tab {{ padding:4px 12px; font-size:8pt; }}
+            QTabBar::tab:selected {{ background:{C_ACCENT2}; color:white; }}
+        """)
+        lay.addWidget(ins_sub, stretch=1)
+
+        self._ins_tab_trend = QWidget()
+        self._ins_tab_bar   = QWidget()
+        ins_sub.addTab(self._ins_tab_trend, "📈  トレンド")
+        ins_sub.addTab(self._ins_tab_bar,   "📊  集計")
+
+        # ── トレンドタブ（折れ線）: LIVEおすすめ / 最高同時接続 / ギフト贈呈者数 / ユニーク視聴者数 ──
+        trend_lay = QVBoxLayout(self._ins_tab_trend)
+        trend_lay.setContentsMargins(4, 4, 4, 4)
+        trend_grid = QWidget()
+        tg = QGridLayout(trend_grid)
+        tg.setSpacing(6)
+        self._pw_trend = [
+            _make_plot_widget("LIVEおすすめ率（%）"),     # [0]
+            _make_plot_widget("最高同時視聴者数（人）"),  # [1]
+            _make_plot_widget("ギフト贈呈者数（人）"),    # [2]
+            _make_plot_widget("ユニーク視聴者数（人）"),  # [3]
         ]
-        for i, pw in enumerate(self._pw_ins):
-            gl.addWidget(pw, i // 2, i % 2)
-        lay.addWidget(grid, stretch=1)
+        for i, pw in enumerate(self._pw_trend):
+            tg.addWidget(pw, i // 2, i % 2)
+        trend_lay.addWidget(trend_grid, stretch=1)
+
+        # ── 集計タブ（棒グラフ）: ダイヤ数 / 平均視聴時間 ──
+        bar_lay = QVBoxLayout(self._ins_tab_bar)
+        bar_lay.setContentsMargins(4, 4, 4, 4)
+        bar_row = QWidget()
+        br = QHBoxLayout(bar_row)
+        br.setSpacing(6)
+        self._pw_bar_ins = [
+            _make_plot_widget("ダイヤ数"),           # [0]
+            _make_plot_widget("平均視聴時間（分）"), # [1]
+        ]
+        for pw in self._pw_bar_ins:
+            br.addWidget(pw)
+        bar_lay.addWidget(bar_row, stretch=1)
 
     def _on_show_insights(self):
         df, err = load_insights()
@@ -1063,38 +1290,51 @@ class KinakoApp(QMainWindow):
         col_gifter  = "ギフト贈呈者数"  if "ギフト贈呈者数"  in df.columns else find_col(df,"ギフト贈呈","gifter")
         col_watch   = "平均視聴時間"    if "平均視聴時間"    in df.columns else find_col(df,"平均視聴","watch")
         col_rec     = "LIVEおすすめ"    if "LIVEおすすめ"    in df.columns else find_col(df,"おすすめ","recommend")
+        col_unique  = "ユニーク視聴者数" if "ユニーク視聴者数" in df.columns else find_col(df,"ユニーク","unique")
 
-        # 数値変換：peak / diamond / gifter は pd.to_numeric で十分
-        for col in [col_peak, col_diamond, col_gifter]:
+        # 数値変換
+        for col in [col_peak, col_diamond, col_gifter, col_unique]:
             if col: df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # 平均視聴時間：「4分」「2時間11分」「6秒」→ 分単位 float に変換
         if col_watch:
             df[col_watch] = df[col_watch].apply(_parse_watch_time_to_minutes)
-
-        # LIVEおすすめ：「60%」→ 60.0、「N/A」→ 0.0
         if col_rec:
             df[col_rec] = df[col_rec].apply(_parse_recommend_pct)
 
+        # X軸ラベルを日付（MM/DD）で統一
         labels = (df["_date"].dt.strftime("%m/%d").tolist()
                   if "_date" in df.columns else [str(i) for i in range(len(df))])
 
-        cfgs = [
-            (self._pw_ins[0], col_peak,    "#4f86c6"),
-            (self._pw_ins[1], col_diamond, "#f5a623"),
-            (self._pw_ins[2], col_gifter,  "#7ed321"),
-            (self._pw_ins[3], col_watch,   "#e87c7c"),
-            (self._pw_ins[4], col_rec,     "#c084fc"),
+        # ── 折れ線グラフ（トレンドタブ）──
+        trend_cfgs = [
+            (self._pw_trend[0], col_rec,    "#c084fc"),
+            (self._pw_trend[1], col_peak,   "#4f86c6"),
+            (self._pw_trend[2], col_gifter, "#7ed321"),
+            (self._pw_trend[3], col_unique, "#f5a623"),
         ]
-        for pw, col, color in cfgs:
+        for pw, col, color in trend_cfgs:
             try:
+                pw.clear()
+                if col and col in df.columns:
+                    vals = df[col].fillna(0).tolist()
+                    _line_graph(pw, vals, color, labels)
+                else:
+                    pw.addItem(pg.TextItem("データなし", color=C_SUBTEXT, anchor=(0.5, 0.5)))
+            except Exception:
+                pass
+
+        # ── 棒グラフ（集計タブ）──
+        bar_cfgs = [
+            (self._pw_bar_ins[0], col_diamond, "#f5a623"),
+            (self._pw_bar_ins[1], col_watch,   "#e87c7c"),
+        ]
+        for pw, col, color in bar_cfgs:
+            try:
+                pw.clear()
                 if col and col in df.columns:
                     vals = df[col].fillna(0).tolist()
                     _bar_graph(pw, vals, color, labels)
                 else:
-                    pw.clear()
-                    pw.addItem(pg.TextItem("データなし", color=C_SUBTEXT,
-                                           anchor=(0.5, 0.5)))
+                    pw.addItem(pg.TextItem("データなし", color=C_SUBTEXT, anchor=(0.5, 0.5)))
             except Exception:
                 pass
 
@@ -1102,19 +1342,16 @@ class KinakoApp(QMainWindow):
     def _build_gift_report(self):
         lay = QVBoxLayout(self._rtab_gift)
         lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(4)
         self._de_gift_start, self._de_gift_end = self._make_ctrl_row(lay, self._on_show_gift)
 
-        row = QWidget()
-        rl  = QHBoxLayout(row)
-        rl.setSpacing(6)
-        self._pw_gift_hourly  = _make_plot_widget("時間帯別ギフト回数")
-        self._pw_gift_top     = _make_plot_widget("トップギフター Top10")
-        self._pw_gift_type    = _make_plot_widget("ギフト種別 Top10")
-        # 時間帯グラフはやや広め
-        self._pw_gift_hourly.setMinimumWidth(300)
-        for pw in (self._pw_gift_hourly, self._pw_gift_top, self._pw_gift_type):
-            rl.addWidget(pw)
-        lay.addWidget(row, stretch=1)
+        # 上段：時間帯別ギフト回数（横長）
+        self._pw_gift_hourly = _make_plot_widget("時間帯別ギフト回数（0〜23時）")
+        lay.addWidget(self._pw_gift_hourly, stretch=1)
+
+        # 下段：ギフト種別 Top10（横長・縦棒で横軸にギフト名）
+        self._pw_gift_type = _make_plot_widget("ギフト種別 Top10")
+        lay.addWidget(self._pw_gift_type, stretch=1)
 
     def _on_show_gift(self):
         df, err = load_gifts()
@@ -1127,51 +1364,60 @@ class KinakoApp(QMainWindow):
         self._gift_df = df_r
         if df_r.empty: return
 
-        # 時間帯別
+        # 時間帯別（0〜23時でデフォルト表示・マイナス不要）
         try:
             self._pw_gift_hourly.clear()
+            # 0〜23 の全時間帯を用意（データがない時間は 0）
+            all_hours = list(range(24))
             if "_date" in df_r.columns:
                 df_r["hour"] = df_r["_date"].dt.hour
-                hourly = df_r.groupby("hour").size()
-                hours  = hourly.index.tolist()
-                vals   = hourly.values.tolist()
-                bar = pg.BarGraphItem(x=hours, height=vals, width=0.6,
+                hourly_raw = df_r.groupby("hour").size()
+                vals = [int(hourly_raw.get(h, 0)) for h in all_hours]
+                bar = pg.BarGraphItem(x=all_hours, height=vals, width=0.6,
                                       brush=pg.mkBrush("#f5a623cc"),
                                       pen=pg.mkPen("#f5a623"))
                 self._pw_gift_hourly.addItem(bar)
-                for xi, v in zip(hours, vals):
-                    t = pg.TextItem(str(v), color="white", anchor=(0.5, 1.0))
-                    t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
-                    t.setPos(xi, v)
-                    self._pw_gift_hourly.addItem(t)
+                for xi, v in zip(all_hours, vals):
+                    if v > 0:
+                        t = pg.TextItem(str(v), color="white", anchor=(0.5, 1.0))
+                        t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
+                        t.setPos(xi, v)
+                        self._pw_gift_hourly.addItem(t)
+                # Y軸の下限を 0 に固定（マイナス非表示）
+                self._pw_gift_hourly.setYRange(0, max(vals) * 1.15 if max(vals) > 0 else 1)
                 self._pw_gift_hourly.getPlotItem().getAxis("bottom").setLabel("時刻（時）", color=C_SUBTEXT)
                 self._pw_gift_hourly.getPlotItem().getAxis("left").setLabel("ギフト回数", color=C_SUBTEXT)
+                # X 軸ティック（0〜23）
+                ticks = [(h, str(h)) for h in all_hours]
+                self._pw_gift_hourly.getPlotItem().getAxis("bottom").setTicks([ticks])
         except Exception:
             pass
 
-        # トップギフター
-        try:
-            self._pw_gift_top.clear()
-            if "user" in df_r.columns:
-                tg   = df_r.groupby("user").size().nlargest(10)
-                lbls = tg.index.tolist()[::-1]
-                vals = tg.values.tolist()[::-1]
-                _barh_graph(self._pw_gift_top, vals, lbls, "#7ed321")
-        except Exception:
-            pass
-
-        # ギフト種別
+        # ギフト種別 Top10（縦棒・横軸にギフト名を表示）
         try:
             self._pw_gift_type.clear()
             if "gift_name" in df_r.columns:
                 col_count = "count" if "count" in df_r.columns else None
-                if col_count:
-                    tgt = df_r.groupby("gift_name")[col_count].sum().nlargest(10)
-                else:
-                    tgt = df_r.groupby("gift_name").size().nlargest(10)
-                lbls = tgt.index.tolist()[::-1]
-                vals = [int(v) for v in tgt.values.tolist()[::-1]]
-                _barh_graph(self._pw_gift_type, vals, lbls, "#4f86c6")
+                tgt = (df_r.groupby("gift_name")[col_count].sum()
+                       if col_count else df_r.groupby("gift_name").size())
+                tgt = tgt.nlargest(10).sort_values()   # 小さい順（棒グラフ左から）
+                gift_labels = tgt.index.tolist()
+                gift_vals   = [int(v) for v in tgt.values.tolist()]
+                # 縦棒グラフ（横軸＝ギフト名）
+                x = list(range(len(gift_labels)))
+                bar = pg.BarGraphItem(x=x, height=gift_vals, width=0.6,
+                                      brush=pg.mkBrush("#4f86c6cc"),
+                                      pen=pg.mkPen("#4f86c6"))
+                self._pw_gift_type.addItem(bar)
+                for xi, v in zip(x, gift_vals):
+                    t = pg.TextItem(str(v), color="white", anchor=(0.5, 1.0))
+                    t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
+                    t.setPos(xi, v)
+                    self._pw_gift_type.addItem(t)
+                # 横軸にギフト名を設定
+                _set_x_labels(self._pw_gift_type, gift_labels)
+                self._pw_gift_type.setYRange(0, max(gift_vals) * 1.15 if gift_vals else 1)
+                self._pw_gift_type.getPlotItem().getAxis("left").setLabel("個数", color=C_SUBTEXT)
         except Exception:
             pass
 
@@ -1179,17 +1425,20 @@ class KinakoApp(QMainWindow):
     def _build_repeat_report(self):
         lay = QVBoxLayout(self._rtab_repeat)
         lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
         self._de_rep_start, self._de_rep_end = self._make_ctrl_row(lay, self._on_show_repeat)
 
-        row = QWidget()
-        rl  = QHBoxLayout(row)
-        rl.setSpacing(6)
-        self._pw_rep_pie      = _make_plot_widget("リピーター比率")
-        self._pw_rep_session  = _make_plot_widget("セッション別ユニーク視聴者")
-        self._pw_rep_top      = _make_plot_widget("リピーター Top10")
-        for pw in (self._pw_rep_pie, self._pw_rep_session, self._pw_rep_top):
-            rl.addWidget(pw)
-        lay.addWidget(row, stretch=1)
+        # 円グラフウィジェット（中央に大きく表示）
+        self._pie_repeat = PieChartWidget()
+        self._pie_repeat.setMinimumHeight(320)
+        lay.addWidget(self._pie_repeat, stretch=1)
+
+        # サマリーラベル
+        self._lbl_rep_summary = QLabel("グラフを表示してください")
+        self._lbl_rep_summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_rep_summary.setStyleSheet(
+            f"color:{C_SUBTEXT}; font-size:11pt; padding:6px;")
+        lay.addWidget(self._lbl_rep_summary)
 
     def _on_show_repeat(self):
         df, err = load_viewers()
@@ -1200,62 +1449,236 @@ class KinakoApp(QMainWindow):
         df = df[(df["session_date"] >= s) & (df["session_date"] <= e)]
         # ★ 空でも先に代入（エクスポートで「未表示」エラーを防ぐ）
         self._repeat_df = df
-        if df.empty: return
+        if df.empty:
+            self._pie_repeat.set_data([], "データなし")
+            self._lbl_rep_summary.setText("期間内のデータがありません")
+            return
 
         uid_col  = "uid" if "uid" in df.columns else \
                    (df.columns[2] if len(df.columns) > 2 else None)
-        name_col = "display_name" if "display_name" in df.columns else None
         if uid_col is None: return
 
         sc      = df.groupby(uid_col)["session_date"].nunique()
         total   = len(sc)
         repeats = int((sc >= 2).sum())
+        firsts  = total - repeats
         rate    = repeats / total * 100 if total > 0 else 0.0
-        sv      = df.groupby("session_date")[uid_col].nunique().sort_index()
-        top_r   = sc[sc >= 2].nlargest(10)
-        top_lbl = ([df.drop_duplicates(uid_col).set_index(uid_col)[name_col].get(u, str(u))
-                    for u in top_r.index]
-                   if name_col else [str(u) for u in top_r.index])
 
-        # --- 比率グラフ（棒グラフで代替。PyQtGraph は円グラフ非対応）---
-        self._pw_rep_pie.clear()
-        if total > 0:
-            bar_pie = pg.BarGraphItem(
-                x=[0, 1],
-                height=[repeats, total - repeats],
-                width=0.5,
-                brushes=[pg.mkBrush(C_ACCENT + "cc"), pg.mkBrush("#c4b5fd" + "cc")],
-                pens=[pg.mkPen(C_ACCENT), pg.mkPen("#c4b5fd")]
-            )
-            self._pw_rep_pie.addItem(bar_pie)
-            for xi, v, lbl in zip([0, 1],
-                                   [repeats, total - repeats],
-                                   [f"リピーター\n{repeats}人\n{rate:.1f}%",
-                                    f"初回のみ\n{total-repeats}人"]):
-                t = pg.TextItem(lbl, color="white", anchor=(0.5, 1.0))
-                t.setFont(pg.QtGui.QFont(_JP_FONT, 8))
+        # 円グラフデータをセット
+        slices = []
+        if repeats > 0:
+            slices.append((float(repeats), "リピーター",  C_ACCENT))
+        if firsts > 0:
+            slices.append((float(firsts),  "初回のみ",    "#c4b5fd"))
+        title = f"リピーター比率  ({self._de_rep_start.date().toString('yyyy/MM/dd')} ～ {self._de_rep_end.date().toString('yyyy/MM/dd')})"
+        self._pie_repeat.set_data(slices, title)
+
+        # サマリーラベル
+        self._lbl_rep_summary.setText(
+            f"ユニーク視聴者: {total}人  ／  "
+            f"リピーター: {repeats}人 ({rate:.1f}%)  ／  "
+            f"初回のみ: {firsts}人"
+        )
+        self._lbl_rep_summary.setStyleSheet(
+            f"color:{C_TEXT}; font-size:11pt; font-weight:bold; padding:6px;")
+
+    # ── ユーザーランキングタブ ──
+    def _build_ranking_tab(self):
+        lay = QVBoxLayout(self._rtab_ranking)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        self._de_rank_start, self._de_rank_end = self._make_ctrl_row(lay, self._on_show_ranking)
+
+        # スプリッター: 上段=棒グラフ2本, 下段=テーブル
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        lay.addWidget(splitter, stretch=1)
+
+        # 棒グラフエリア（リピーター数 / ギフト額）
+        graph_widget = QWidget()
+        graph_lay    = QHBoxLayout(graph_widget)
+        graph_lay.setContentsMargins(0, 0, 0, 0)
+        graph_lay.setSpacing(6)
+        self._pw_rank_repeat = _make_plot_widget("リピーター数 Top20")
+        self._pw_rank_gift   = _make_plot_widget("ギフト合計 Top20（ダイヤ）")
+        graph_lay.addWidget(self._pw_rank_repeat)
+        graph_lay.addWidget(self._pw_rank_gift)
+        splitter.addWidget(graph_widget)
+
+        # テーブルエリア（QTextEdit でシンプルHTML表示）
+        self._rank_table = QTextEdit()
+        self._rank_table.setReadOnly(True)
+        self._rank_table.setStyleSheet(
+            f"background:{C_PANEL}; color:{C_TEXT}; "
+            f"font-family:'Meiryo','MS Gothic',monospace; font-size:9pt; "
+            f"border:1px solid {C_BORDER}; border-radius:4px;")
+        splitter.addWidget(self._rank_table)
+        splitter.setSizes([340, 200])
+
+        self._ranking_df = None
+
+    def _on_show_ranking(self):
+        """viewers.csv と gift_timeline.csv を統合してユーザーランキングを表示"""
+        s_str = self._de_rank_start.date().toString("yyyy-MM-dd")
+        e_str = self._de_rank_end.date().toString("yyyy-MM-dd")
+        s_date = pd.to_datetime(s_str).date()
+        e_date = (pd.to_datetime(e_str) + pd.Timedelta(days=1)
+                  - pd.Timedelta(seconds=1)).date()
+
+        # ── viewers.csv からリピーター数（参加セッション数）を集計 ──
+        rep_map: dict = {}   # uid -> (display_name, session_count)
+        try:
+            vdf, verr = load_viewers()
+            if vdf is not None and not verr:
+                vdf = vdf[(vdf["session_date"] >= s_date) & (vdf["session_date"] <= e_date)]
+                uid_col  = next((c for c in vdf.columns
+                                  if c.lower() in ("unique_id","uid","user_id")),
+                                 vdf.columns[2] if len(vdf.columns) > 2 else None)
+                name_col = "display_name" if "display_name" in vdf.columns else None
+                if uid_col:
+                    sc = vdf.groupby(uid_col)["session_date"].nunique()
+                    for uid, cnt in sc.items():
+                        name = uid
+                        if name_col:
+                            row_match = vdf[vdf[uid_col] == uid]
+                            if not row_match.empty:
+                                name = row_match.iloc[0][name_col]
+                        rep_map[uid] = (str(name), int(cnt))
+        except Exception:
+            pass
+
+        # ── gift_timeline.csv からギフト合計（ダイヤ）を集計 ──
+        gift_map: dict = {}  # uid -> (display_name, total_diamonds)
+        try:
+            gdf, gerr = load_gifts()
+            if gdf is not None and not gerr:
+                gdf["_gdate"] = gdf["_date"].dt.date
+                gdf = gdf[(gdf["_gdate"] >= s_date) & (gdf["_gdate"] <= e_date)]
+                if not gdf.empty:
+                    # ユーザー列を探す（unique_id / uid / user_id 等）
+                    uid_g   = next((c for c in gdf.columns
+                                    if c.lower() in ("unique_id","uid","user_id","username")), None)
+                    name_g  = next((c for c in gdf.columns
+                                    if c.lower() in ("display_name","name","nickname","user")), None)
+                    # ダイヤ数列を探す（diamonds / diamond / reward 等）
+                    dia_col = next((c for c in gdf.columns
+                                    if c.lower() in ("diamonds","diamond","reward","ダイヤ","ダイヤ合計")), None)
+                    if uid_g:
+                        if dia_col:
+                            gdf[dia_col] = pd.to_numeric(gdf[dia_col], errors="coerce").fillna(0)
+                            gs = gdf.groupby(uid_g)[dia_col].sum()
+                        else:
+                            # ダイヤ列がなければ count 列を代用
+                            count_c = "count" if "count" in gdf.columns else None
+                            if count_c:
+                                gdf[count_c] = pd.to_numeric(gdf[count_c], errors="coerce").fillna(0)
+                                gs = gdf.groupby(uid_g)[count_c].sum()
+                            else:
+                                gs = gdf.groupby(uid_g).size()
+                        for uid, total in gs.items():
+                            name = uid
+                            if name_g:
+                                row_match = gdf[gdf[uid_g] == uid]
+                                if not row_match.empty:
+                                    name = row_match.iloc[0][name_g]
+                            gift_map[uid] = (str(name), float(total))
+        except Exception:
+            pass
+
+        # ── 統合 DataFrame を作成 ──
+        all_uids = set(rep_map.keys()) | set(gift_map.keys())
+        if not all_uids:
+            self._rank_table.setHtml(
+                f"<p style='color:{C_SUBTEXT};padding:12px;'>期間内のデータがありません</p>")
+            self._pw_rank_repeat.clear()
+            self._pw_rank_gift.clear()
+            self._ranking_df = None
+            return
+
+        rows = []
+        for uid in all_uids:
+            rep_name, rep_cnt = rep_map.get(uid, (uid, 0))
+            gift_name, gift_total = gift_map.get(uid, (uid, 0.0))
+            display = rep_name if rep_name != uid else gift_name
+            rows.append({
+                "ユーザーID":    str(uid),
+                "表示名":        str(display),
+                "参加セッション数": int(rep_cnt),
+                "ギフト合計(ダイヤ)": float(gift_total),
+            })
+
+        rank_df = pd.DataFrame(rows).sort_values(
+            ["ギフト合計(ダイヤ)", "参加セッション数"], ascending=False
+        ).reset_index(drop=True)
+        rank_df.index = rank_df.index + 1  # 1始まりランク
+        # エクスポート用に「順位」列を先頭に追加したコピーを保持
+        self._ranking_df = rank_df.reset_index().rename(columns={"index": "順位"})
+
+        # ── 棒グラフ: リピーター数 Top20 ──
+        top_rep = rank_df.nlargest(20, "参加セッション数")
+        if not top_rep.empty:
+            labels_r = top_rep["表示名"].tolist()
+            vals_r   = top_rep["参加セッション数"].tolist()
+            self._pw_rank_repeat.clear()
+            x = list(range(len(labels_r)))
+            bar_r = pg.BarGraphItem(x=x, height=vals_r, width=0.6,
+                                    brush=pg.mkBrush(C_ACCENT + "cc"),
+                                    pen=pg.mkPen(C_ACCENT))
+            self._pw_rank_repeat.addItem(bar_r)
+            for xi, v in zip(x, vals_r):
+                t = pg.TextItem(str(v), color="white", anchor=(0.5, 1.0))
+                t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
                 t.setPos(xi, v)
-                self._pw_rep_pie.addItem(t)
-            ticks = [(0, "リピーター"), (1, "初回のみ")]
-            self._pw_rep_pie.getPlotItem().getAxis("bottom").setTicks([ticks])
-            self._pw_rep_pie.setTitle(
-                f"<span style='color:#c4b5fd;font-size:10pt'>"
-                f"リピーター比率　ユニーク視聴者: {total}人 / "
-                f"リピーター: {repeats}人 / {rate:.1f}%</span>")
+                self._pw_rank_repeat.addItem(t)
+            _set_x_labels(self._pw_rank_repeat, labels_r)
+            self._pw_rank_repeat.setYRange(0, max(vals_r) * 1.15 if vals_r else 1)
+            self._pw_rank_repeat.getPlotItem().getAxis("left").setLabel("セッション数", color=C_SUBTEXT)
+        else:
+            self._pw_rank_repeat.clear()
 
-        # セッション別ユニーク視聴者
-        if not sv.empty:
-            dates = [str(d) for d in sv.index]
-            _bar_graph(self._pw_rep_session, sv.values.tolist(), "#4f86c6", dates)
+        # ── 棒グラフ: ギフト合計 Top20 ──
+        top_gift = rank_df.nlargest(20, "ギフト合計(ダイヤ)")
+        if not top_gift.empty and top_gift["ギフト合計(ダイヤ)"].sum() > 0:
+            labels_g = top_gift["表示名"].tolist()
+            vals_g   = [int(v) for v in top_gift["ギフト合計(ダイヤ)"].tolist()]
+            self._pw_rank_gift.clear()
+            x = list(range(len(labels_g)))
+            bar_g = pg.BarGraphItem(x=x, height=vals_g, width=0.6,
+                                    brush=pg.mkBrush("#f5a623cc"),
+                                    pen=pg.mkPen("#f5a623"))
+            self._pw_rank_gift.addItem(bar_g)
+            for xi, v in zip(x, vals_g):
+                t = pg.TextItem(str(v), color="white", anchor=(0.5, 1.0))
+                t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
+                t.setPos(xi, v)
+                self._pw_rank_gift.addItem(t)
+            _set_x_labels(self._pw_rank_gift, labels_g)
+            self._pw_rank_gift.setYRange(0, max(vals_g) * 1.15 if vals_g else 1)
+            self._pw_rank_gift.getPlotItem().getAxis("left").setLabel("ダイヤ合計", color=C_SUBTEXT)
+        else:
+            self._pw_rank_gift.clear()
 
-        # リピーター Top10
-        if len(top_r) > 0:
-            _barh_graph(self._pw_rep_top,
-                        top_r.values.tolist()[::-1],
-                        top_lbl[::-1],
-                        "#7ed321")
-            self._pw_rep_top.getPlotItem().getAxis("bottom").setLabel(
-                "参加セッション数", color=C_SUBTEXT)
+        # ── テーブル表示 (HTML) ──
+        html = (
+            f"<table width='100%' cellspacing='0' cellpadding='4' "
+            f"style='border-collapse:collapse;'>"
+            f"<tr style='background:{C_ACCENT2};color:white;font-weight:bold;'>"
+            f"<th>順位</th><th>表示名</th><th>ユーザーID</th>"
+            f"<th>参加セッション数</th><th>ギフト合計(ダイヤ)</th></tr>"
+        )
+        for i, (idx_val, row) in enumerate(rank_df.iterrows()):
+            bg = C_PANEL if i % 2 == 0 else C_BG
+            rank_no = idx_val  # 1始まりのランク
+            html += (
+                f"<tr style='background:{bg};'>"
+                f"<td align='center'>{rank_no}</td>"
+                f"<td>{row['表示名']}</td>"
+                f"<td style='color:{C_SUBTEXT};font-size:8pt;'>{row['ユーザーID']}</td>"
+                f"<td align='center'>{int(row['参加セッション数'])}</td>"
+                f"<td align='center'>{int(row['ギフト合計(ダイヤ)'])}</td>"
+                f"</tr>"
+            )
+        html += "</table>"
+        self._rank_table.setHtml(html)
 
     # ─────────────────────────────────────────────────────────
     #  エクスポート
@@ -1267,6 +1690,7 @@ class KinakoApp(QMainWindow):
         if idx == 1: return self._gift_df, \
             f"ギフト_{self._de_gift_start.date().toString('yyyyMMdd')}"
         if idx == 2: return self._repeat_df, "リピート率レポート"
+        if idx == 3: return getattr(self, "_ranking_df", None), "ユーザーランキング"
         return None, ""
 
     def _on_export_excel(self):
