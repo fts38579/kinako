@@ -217,6 +217,23 @@ def _save_debug_html(driver: ChromeDriver, label: str = "") -> None:
     print(f"[Insights] デバッグ HTML 保存: {path} [{label}]")
 
 
+def _migrate_csv(path: str, headers: list) -> None:
+    """既存 CSV のヘッダーに不足列があれば末尾に追加する（後方互換マイグレーション）"""
+    try:
+        import pandas as _pd
+        df = _pd.read_csv(path, encoding="utf-8-sig")
+        added = []
+        for col in headers:
+            if col not in df.columns:
+                df[col] = "N/A"
+                added.append(col)
+        if added:
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            print(f"[Insights] CSV マイグレーション: 列追加 {added}")
+    except Exception as e:
+        print(f"[Insights] CSV マイグレーション スキップ: {e}")
+
+
 def _write_csv(row_data: dict) -> None:
     """insights.csv へ追記保存する"""
 
@@ -233,6 +250,10 @@ def _write_csv(row_data: dict) -> None:
         "最高同時視聴者数", "平均視聴時間", "ギフト贈呈者数",
         "LIVEおすすめ", "ダイヤ合計", "ユニーク視聴者数",
     ]
+
+    # ★ 既存ファイルにヘッダー列不足があればマイグレーション
+    if os.path.exists(path):
+        _migrate_csv(path, headers)
 
     file_exists = os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8-sig") as f:
