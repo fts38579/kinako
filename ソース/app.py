@@ -344,12 +344,16 @@ def _parse_watch_time_to_minutes(val):
     return total
 
 def _parse_recommend_pct(val):
-    """「60%」→ 60.0、「N/A」→ 0.0、「-」→ 0.0 に変換する。"""
+    """「60%」→ 60.0、「40」→ 40.0、「N/A」→ 0.0、「-」→ 0.0 に変換する。
+    pandas が数値として読んだ場合（40.0）も正しく処理する。"""
     if pd.isna(val): return 0.0
+    # 数値型のまま渡された場合（pandas が float/int で読み込んだケース）
+    if isinstance(val, (int, float)):
+        return max(0.0, float(val))
     s = str(val).strip()
     if not s or s in ("N/A", "-", ""): return 0.0
     s = s.replace("%", "").strip()
-    try: return float(s)
+    try: return max(0.0, float(s))
     except ValueError: return 0.0
 
 def _insights_csv_path():
@@ -364,8 +368,18 @@ def load_insights():
     if not _HAS_PANDAS: return None, "pandas が必要です"
     path = _insights_csv_path()
     if not os.path.exists(path): return None, f"insights.csv が見つかりません\n{path}"
+    # 文字コードをフォールバックしながら読み込む（Excel保存等に対応）
+    # dtype=object で全列を文字列として読み込み、「40%」等の混在型も正しく扱う
+    df = None
+    for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+        try:
+            df = pd.read_csv(path, encoding=enc, dtype=object)
+            break
+        except Exception:
+            continue
+    if df is None:
+        return None, "insights.csv の読み込みに失敗しました（文字コード不明）"
     try:
-        df = pd.read_csv(path, encoding="utf-8-sig")
         date_col = next((c for c in df.columns
                          if any(k in c for k in ["日","date","時","取得"])), None)
         df["_date"] = pd.to_datetime(
