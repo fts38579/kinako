@@ -380,10 +380,48 @@ def load_insights():
     if df is None:
         return None, "insights.csv の読み込みに失敗しました（文字コード不明）"
     try:
-        date_col = next((c for c in df.columns
-                         if any(k in c for k in ["日","date","時","取得"])), None)
-        df["_date"] = pd.to_datetime(
-            df[date_col] if date_col else df.iloc[:,0], errors="coerce")
+        # 「日付」列を優先（例: "2026年3月15日 午後9:58" 形式）
+        # ① まず "日付" という列名を探す
+        # ② 次に "日" を含む列（ただし "取得日時" を除く）
+        # ③ フォールバックとして "取得日時" などその他の日時列
+        def _find_date_col(columns):
+            # 優先1: "日付" 列
+            for c in columns:
+                if c.strip() == "日付":
+                    return c
+            # 優先2: "日" を含むが "取得" を含まない列
+            for c in columns:
+                if "日" in c and "取得" not in c:
+                    return c
+            # フォールバック: "取得日時" などの日時列
+            for c in columns:
+                if any(k in c for k in ["date", "時", "取得"]):
+                    return c
+            return None
+
+        date_col = _find_date_col(df.columns)
+
+        # 「日付」列が "2026年3月15日..." 形式の場合はカスタムパース
+        def _parse_jp_date_str(s):
+            if not isinstance(s, str):
+                return None
+            m = re.match(r"(\d{4})年(\d+)月(\d+)日", s)
+            if m:
+                return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+            return s  # そのまま返して pd.to_datetime に委ねる
+
+        if date_col:
+            parsed_series = df[date_col].apply(_parse_jp_date_str)
+        else:
+            parsed_series = df.iloc[:, 0]
+
+        df["_date"] = pd.to_datetime(parsed_series, errors="coerce")
+        # パース失敗行は取得日時列でフォールバック
+        if df["_date"].isna().any():
+            fallback_col = next((c for c in df.columns if "取得" in c or "date" in c.lower()), None)
+            if fallback_col and fallback_col != date_col:
+                fallback = pd.to_datetime(df[fallback_col], errors="coerce")
+                df["_date"] = df["_date"].fillna(fallback)
         df = df.dropna(subset=["_date"]).sort_values("_date").reset_index(drop=True)
         return df, None
     except Exception as e:
@@ -442,7 +480,9 @@ def _set_x_labels(pw: pg.PlotWidget, labels: list):
     """棒グラフの X 軸に文字列ラベルを設定（日付など）"""
     ticks = [(i, lbl) for i, lbl in enumerate(labels)]
     ax = pw.getPlotItem().getAxis("bottom")
-    ax.setTicks([ticks])
+    # autoSIPrefix を無効にして単位変換による上書きを防ぐ
+    ax.enableAutoSIPrefix(False)
+    ax.setTicks([ticks, []])  # major + empty minor で確実に上書き
 
 
 def _bar_graph(pw: pg.PlotWidget, values: list, color: str,
@@ -484,13 +524,13 @@ def _bar_graph(pw: pg.PlotWidget, values: list, color: str,
         )
         pw.addItem(inf_line)
 
-    if labels:
-        _set_x_labels(pw, labels)
-
     # Y軸は正値のみ表示（下限0固定）
     max_v = max(values) if values else 0
     pw.setYRange(0, max_v * 1.15 if max_v > 0 else 1)
     pw.setLimits(yMin=0)
+    # setYRange の後に X 軸ラベルを設定（上書き防止）
+    if labels:
+        _set_x_labels(pw, labels)
 
 
 def _barh_graph(pw: pg.PlotWidget, values: list, labels: list, color: str):
@@ -557,13 +597,13 @@ def _line_graph(pw: pg.PlotWidget, values: list, color: str,
                        "font": pg.QtGui.QFont(_JP_FONT, 8)}
         )
         pw.addItem(inf_line)
-    if labels:
-        _set_x_labels(pw, labels)
-
     # Y軸は正値のみ表示（下限0固定）
     max_v = max(values) if values else 0
     pw.setYRange(0, max_v * 1.2 if max_v > 0 else 1)
     pw.setLimits(yMin=0)
+    # setYRange の後に X 軸ラベルを設定（上書き防止）
+    if labels:
+        _set_x_labels(pw, labels)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1415,11 +1455,13 @@ class KinakoApp(QMainWindow):
                 # Y軸の下限を 0 に固定（マイナス非表示）
                 self._pw_gift_hourly.setYRange(0, max(vals) * 1.15 if max(vals) > 0 else 1)
                 self._pw_gift_hourly.setLimits(yMin=0)
-                self._pw_gift_hourly.getPlotItem().getAxis("bottom").setLabel("時刻（時）", color=C_SUBTEXT)
                 self._pw_gift_hourly.getPlotItem().getAxis("left").setLabel("ギフト回数", color=C_SUBTEXT)
-                # X 軸ティック（0〜23）
+                # X 軸ティック（0〜23）は setYRange の後で設定（上書き防止）
+                hourly_ax = self._pw_gift_hourly.getPlotItem().getAxis("bottom")
+                hourly_ax.enableAutoSIPrefix(False)
+                hourly_ax.setLabel("時刻（時）", color=C_SUBTEXT)
                 ticks = [(h, str(h)) for h in all_hours]
-                self._pw_gift_hourly.getPlotItem().getAxis("bottom").setTicks([ticks])
+                hourly_ax.setTicks([ticks, []])
         except Exception:
             pass
 
@@ -1444,10 +1486,10 @@ class KinakoApp(QMainWindow):
                     t.setFont(pg.QtGui.QFont(_JP_FONT, 7))
                     t.setPos(xi, v)
                     self._pw_gift_type.addItem(t)
-                # 横軸にギフト名を設定
-                _set_x_labels(self._pw_gift_type, gift_labels)
                 self._pw_gift_type.setYRange(0, max(gift_vals) * 1.15 if gift_vals else 1)
                 self._pw_gift_type.setLimits(yMin=0)
+                # 横軸にギフト名を設定（setYRange の後で上書き防止）
+                _set_x_labels(self._pw_gift_type, gift_labels)
                 self._pw_gift_type.getPlotItem().getAxis("left").setLabel("個数", color=C_SUBTEXT)
         except Exception:
             pass
