@@ -473,6 +473,11 @@ def _bar_graph(pw: pg.PlotWidget, values: list, color: str,
     if labels:
         _set_x_labels(pw, labels)
 
+    # Y軸は正値のみ表示（下限0固定）
+    max_v = max(values) if values else 0
+    pw.setYRange(0, max_v * 1.15 if max_v > 0 else 1)
+    pw.setLimits(yMin=0)
+
 
 def _barh_graph(pw: pg.PlotWidget, values: list, labels: list, color: str):
     """横棒グラフを描画（Top10 ランキング用）"""
@@ -498,6 +503,11 @@ def _barh_graph(pw: pg.PlotWidget, values: list, labels: list, color: str):
     ticks = [(i, lbl) for i, lbl in enumerate(labels)]
     pw.getPlotItem().getAxis("left").setTicks([ticks])
     pw.getPlotItem().getAxis("bottom").setLabel("回数", color=C_SUBTEXT)
+
+    # X軸（値軸）は正値のみ（下限0固定）
+    max_v = max(values) if values else 0
+    pw.setXRange(0, max_v * 1.2 if max_v > 0 else 1)
+    pw.setLimits(xMin=0)
 
 
 def _line_graph(pw: pg.PlotWidget, values: list, color: str,
@@ -535,6 +545,11 @@ def _line_graph(pw: pg.PlotWidget, values: list, color: str,
         pw.addItem(inf_line)
     if labels:
         _set_x_labels(pw, labels)
+
+    # Y軸は正値のみ表示（下限0固定）
+    max_v = max(values) if values else 0
+    pw.setYRange(0, max_v * 1.2 if max_v > 0 else 1)
+    pw.setLimits(yMin=0)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1385,6 +1400,7 @@ class KinakoApp(QMainWindow):
                         self._pw_gift_hourly.addItem(t)
                 # Y軸の下限を 0 に固定（マイナス非表示）
                 self._pw_gift_hourly.setYRange(0, max(vals) * 1.15 if max(vals) > 0 else 1)
+                self._pw_gift_hourly.setLimits(yMin=0)
                 self._pw_gift_hourly.getPlotItem().getAxis("bottom").setLabel("時刻（時）", color=C_SUBTEXT)
                 self._pw_gift_hourly.getPlotItem().getAxis("left").setLabel("ギフト回数", color=C_SUBTEXT)
                 # X 軸ティック（0〜23）
@@ -1417,6 +1433,7 @@ class KinakoApp(QMainWindow):
                 # 横軸にギフト名を設定
                 _set_x_labels(self._pw_gift_type, gift_labels)
                 self._pw_gift_type.setYRange(0, max(gift_vals) * 1.15 if gift_vals else 1)
+                self._pw_gift_type.setLimits(yMin=0)
                 self._pw_gift_type.getPlotItem().getAxis("left").setLabel("個数", color=C_SUBTEXT)
         except Exception:
             pass
@@ -1631,6 +1648,7 @@ class KinakoApp(QMainWindow):
                 self._pw_rank_repeat.addItem(t)
             _set_x_labels(self._pw_rank_repeat, labels_r)
             self._pw_rank_repeat.setYRange(0, max(vals_r) * 1.15 if vals_r else 1)
+            self._pw_rank_repeat.setLimits(yMin=0)
             self._pw_rank_repeat.getPlotItem().getAxis("left").setLabel("セッション数", color=C_SUBTEXT)
         else:
             self._pw_rank_repeat.clear()
@@ -1653,6 +1671,7 @@ class KinakoApp(QMainWindow):
                 self._pw_rank_gift.addItem(t)
             _set_x_labels(self._pw_rank_gift, labels_g)
             self._pw_rank_gift.setYRange(0, max(vals_g) * 1.15 if vals_g else 1)
+            self._pw_rank_gift.setLimits(yMin=0)
             self._pw_rank_gift.getPlotItem().getAxis("left").setLabel("ダイヤ合計", color=C_SUBTEXT)
         else:
             self._pw_rank_gift.clear()
